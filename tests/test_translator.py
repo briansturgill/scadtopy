@@ -366,6 +366,89 @@ class TranslatorTests(unittest.TestCase):
 
         self.assertIn('ECHO: "done"', output.getvalue())
 
+    def test_translates_children_and_unions_module_bodies(self) -> None:
+        generated = self.translate(
+            """
+            module repeated(count=3) {
+                for(i=[0:count-1]) translate([i*10,0,0]) children();
+            }
+            module pair() { cube(1); sphere(1); }
+            module first() { children(0); }
+            repeated(3) { cube(1); sphere(1); }
+            translate([0,20,0]) pair();
+            translate([0,40,0]) first() { cube(2); sphere(5); }
+            """
+        )
+
+        self.assertIn("def repeated(count=3.0, _children=()):", generated)
+        self.assertIn("_children=[", generated)
+        self.assertNotIn("children() substitution", generated)
+        namespace: dict[str, object] = {}
+        exec(generated, namespace)
+        # Three copies of a cube+sphere union spaced 10 apart.
+        x1, _, _, x2, _, _ = namespace["repeated"](
+            3, _children=[namespace["cube"](1), namespace["sphere"](1)]
+        ).bounding_box()
+        self.assertAlmostEqual(x2 - x1, 22, delta=1.1)
+        self.assertEqual(
+            namespace["first"](_children=[namespace["cube"](2)]).bounding_box(),
+            (0, 0, 0, 2, 2, 2),
+        )
+        self.assertFalse(namespace["_model"].is_empty())
+
+    def test_translates_children_selectors_and_count(self) -> None:
+        generated = self.translate(
+            """
+            module pick() { children([0:1]); translate([20,0,0]) children([2]); }
+            module count() { translate([0,0,$children]) children(0); }
+            module outer() { module inner() { children(1); } inner() { cube(1); cube(3); } }
+            pick() { cube(1); cube(2); cube(3); }
+            count() { cube(1); cube(1); }
+            outer();
+            """
+        )
+
+        self.assertNotIn("FIXME", generated)
+        namespace: dict[str, object] = {}
+        exec(generated, namespace)
+        kids = [namespace["cube"](1), namespace["cube"](2), namespace["cube"](3)]
+        box = namespace["pick"](_children=kids).bounding_box()
+        self.assertAlmostEqual(box[3], 23)
+        box = namespace["count"](_children=kids[:2]).bounding_box()
+        self.assertAlmostEqual(box[2], 2)
+        self.assertAlmostEqual(namespace["outer"]().bounding_box()[3], 3)
+        with self.assertWarns(UserWarning):
+            namespace["_scadtopy_children"](kids, 7)
+
+    def test_translates_offset_radial_and_delta(self) -> None:
+        generated = self.translate(
+            """
+            offset(r=2) square([10,10],center=true);
+            translate([30,0,0]) offset(delta=1) square(4);
+            """
+        )
+
+        self.assertNotIn("FIXME", generated)
+        self.assertIn('.offset(2.0, "round")', generated)
+        self.assertIn('.offset(1.0, "miter", 1000.0)', generated)
+        namespace: dict[str, object] = {}
+        exec(generated, namespace)
+        box = namespace["square"](10, center=True).offset(2, "round").bounding_box()
+        self.assertAlmostEqual(box[2], 7)
+
+    def test_user_function_named_like_piecad_name_does_not_shadow(self) -> None:
+        generated = self.translate(
+            "function square(x) = x * x;\n"
+            "translate([square(2),0,0]) cube(1);\n"
+            "linear_extrude(height=1) square(3);\n"
+        )
+
+        self.assertIn("def square_(x):", generated)
+        namespace: dict[str, object] = {}
+        exec(generated, namespace)
+        self.assertEqual(namespace["square_"](3), 9)
+        self.assertEqual(namespace["_model"].bounding_box()[3], 5.0)
+
     def test_translates_minkowski_with_piecad_method(self) -> None:
         generated = self.translate("minkowski() { cube(1); sphere(1); };")
 

@@ -105,8 +105,51 @@ _TRANSFORMS = {
 }
 
 
+try:
+    import piecad as _piecad
+
+    _PIECAD_EXPORTS = frozenset(n for n in dir(_piecad) if not n.startswith("_"))
+except ImportError:
+    _PIECAD_EXPORTS = frozenset()
+
+
 def _node_name(node: object) -> str:
     return type(node).__name__
+
+
+def _uses_children(node: object) -> bool:
+    if isinstance(node, ModularCall) and node.name.name == "children":
+        return True
+    if isinstance(node, Identifier) and node.name == "$children":
+        return True
+    if isinstance(node, (list, tuple)):
+        return any(_uses_children(item) for item in node)
+    if hasattr(node, "__dict__"):
+        return any(
+            _uses_children(value)
+            for key, value in vars(node).items()
+            if key != "position"
+        )
+    return False
+
+
+def _all_module_names(nodes: Iterable[object]) -> set[str]:
+    names: set[str] = set()
+    for node in nodes:
+        if isinstance(node, ModuleDeclaration):
+            names.add(node.name.name)
+            names |= _all_module_names(node.children)
+    return names
+
+
+def _children_modules(nodes: Iterable[object]) -> set[str]:
+    names: set[str] = set()
+    for node in nodes:
+        if isinstance(node, ModuleDeclaration):
+            if _uses_children(node.children):
+                names.add(node.name.name)
+            names |= _children_modules(node.children)
+    return names
 
 
 def _position(node: object) -> str:
@@ -118,6 +161,9 @@ def _position(node: object) -> str:
 class _Translator:
     def __init__(self) -> None:
         self.module_names: set[str] = set()
+        self.shadowing_names: set[str] = set()
+        self.children_modules: set[str] = set()
+        self.uses_children_helper = False
         self.uses_ranges = False
         self.uses_math = False
         self.uses_translate_helper = False
@@ -126,8 +172,17 @@ class _Translator:
         self.uses_echo_helper = False
         self.fixmes: list[str] = []
 
+    def py_name(self, name: str) -> str:
+        return f"{name}_" if name in self.shadowing_names else name
+
     def translate(self, nodes: Iterable[object]) -> str:
         nodes = list(nodes)
+        self.shadowing_names = {
+            node.name.name
+            for node in nodes
+            if isinstance(node, (FunctionDeclaration, ModuleDeclaration))
+            and node.name.name in _PIECAD_EXPORTS
+        }
         self.uses_ranges = False
         self.uses_math = False
         self.uses_translate_helper = False
@@ -135,9 +190,9 @@ class _Translator:
         self.uses_assert_helper = False
         self.uses_echo_helper = False
         self.fixmes = []
-        self.module_names = {
-            node.name.name for node in nodes if isinstance(node, ModuleDeclaration)
-        }
+        self.uses_children_helper = False
+        self.module_names = _all_module_names(nodes)
+        self.children_modules = _children_modules(nodes)
         statements: list[str] = []
         models: list[str] = []
         saw_model = False
@@ -279,6 +334,26 @@ class _Translator:
                 "        vector = vector[:2]\n"
                 "    return geometry.translate(vector)\n\n"
             )
+        if self.uses_children_helper:
+            prefix += (
+                "def _scadtopy_children(children, selector=None):\n"
+                "    import warnings\n"
+                "    if selector is None:\n"
+                "        picked = list(children)\n"
+                "    else:\n"
+                "        items = selector if isinstance(selector, (list, tuple, range)) "
+                "else [selector]\n"
+                "        picked = []\n"
+                "        for item in items:\n"
+                "            index = int(item)\n"
+                "            if 0 <= index < len(children):\n"
+                "                picked.append(children[index])\n"
+                "            else:\n"
+                "                warnings.warn(f'children({index}) is out of range')\n"
+                "    picked = [child for child in picked if child is not None]\n"
+                "    return union(*picked) if len(picked) > 1 "
+                "else (picked[0] if picked else None)\n\n"
+            )
         if self.uses_projection:
             prefix += (
                 "def _scadtopy_combine_models(models):\n"
@@ -296,7 +371,9 @@ class _Translator:
 
     def module_declaration(self, node: ModuleDeclaration) -> list[str]:
         params = self.parameters(node.parameters)
-        lines = [f"def {node.name.name}({params}):"]
+        if _uses_children(node.children):
+            params = f"{params}, _children=()" if params else "_children=()"
+        lines = [f"def {self.py_name(node.name.name)}({params}):"]
         assignments: list[str] = []
         geometry: list[str] = []
         for child in node.children:
@@ -311,7 +388,9 @@ class _Translator:
             elif isinstance(child, ModularEcho) and not child.children:
                 assignments.append(f"    {self.module_call(child)}")
             elif isinstance(child, ModuleInstantiation):
-                geometry.append(self.module_call(child))
+                translated = self.module_call(child)
+                if translated != "None":
+                    geometry.append(translated)
             elif isinstance(child, FunctionDeclaration):
                 lines.extend(f"    {line}" for line in self.function_declaration(child))
             elif isinstance(child, ModuleDeclaration):
@@ -334,7 +413,7 @@ class _Translator:
 
     def function_declaration(self, node: FunctionDeclaration) -> list[str]:
         params = self.parameters(node.parameters)
-        return [f"def {node.name.name}({params}):", f"    return {self.expression(node.expr)}"]
+        return [f"def {self.py_name(node.name.name)}({params}):", f"    return {self.expression(node.expr)}"]
 
     def parameters(self, parameters: list[object]) -> str:
         return ", ".join(
@@ -524,6 +603,26 @@ class _Translator:
                 result = f"({result}).minkowski_sum({child})"
             return result
 
+        if name == "offset":
+            self.reject_unexpected_named_arguments(
+                node, {"r", "delta", "chamfer", "$fn", "$fa", "$fs"}
+            )
+            if not children:
+                return "None"
+            radius = self.argument_value(node.arguments, ("r",), 0)
+            delta = self.argument_value(node.arguments, ("delta",), -1)
+            chamfer = self.argument_value(node.arguments, ("chamfer",), -1)
+            segments = self.argument_value(node.arguments, ("$fn",), -1)
+            geometry = self.combine(children)
+            if delta is not None:
+                join = f'"square" if {chamfer} else "miter"' if chamfer else '"miter"'
+                call = f"({geometry}).offset({delta}, {join}, 1000.0"
+            else:
+                call = f'({geometry}).offset({radius or "1"}, "round"'
+            if segments is not None and delta is None:
+                call += f", segments=int({segments})"
+            return call + ")"
+
         if name == "projection":
             self.uses_projection = True
             if len(children) != 1:
@@ -633,13 +732,20 @@ class _Translator:
             raise TranslationError(f"polygon() requires points{_position(node)}")
 
         if name == "children":
-            self.note_fixme(node, "children() substitution is not implemented")
-            return "None"
+            self.uses_children_helper = True
+            if not node.arguments:
+                return "_scadtopy_children(_children)"
+            index = self.argument_expression(node.arguments, ("index",), 0)
+            if index is None:
+                return "_scadtopy_children(_children)"
+            return f"_scadtopy_children(_children, {self.expression(index)})"
+        if name in self.module_names:
+            if children and name in self.children_modules:
+                arguments.append(f"_children=[{', '.join(children)}]")
+            return f"{self.py_name(name)}({', '.join(arguments)})"
         if children:
             self.note_fixme(node, f"child geometry for module {name!r} is not translated")
             return "None"
-        if name in self.module_names:
-            return f"{name}({', '.join(arguments)})"
         self.note_fixme(node, f"OpenSCAD module {name!r} has no Piecad mapping")
         return "None"
         raise AssertionError("unreachable")
@@ -996,6 +1102,8 @@ class _Translator:
         if isinstance(node, CommentedExpr):
             return self.expression(node.expr)
         if isinstance(node, Identifier):
+            if node.name == "$children":
+                return "len(_children)"
             if node.name == "PI":
                 self.uses_math = True
                 return "math.pi"
@@ -1039,7 +1147,7 @@ class _Translator:
             if name == "sqrt":
                 self.uses_math = True
                 name = "math.sqrt"
-            return f"{name}({', '.join(self.call_arguments(node.arguments))})"
+            return f"{self.py_name(name)}({', '.join(self.call_arguments(node.arguments))})"
         if isinstance(node, PrimaryIndex):
             return (
                 f"{self.expression(node.left)}"
