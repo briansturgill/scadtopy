@@ -119,6 +119,9 @@ class _Translator:
     def __init__(self) -> None:
         self.module_names: set[str] = set()
         self.uses_ranges = False
+        self.uses_math = False
+        self.uses_translate_helper = False
+        self.uses_projection = False
         self.uses_assert_helper = False
         self.uses_echo_helper = False
         self.fixmes: list[str] = []
@@ -126,6 +129,9 @@ class _Translator:
     def translate(self, nodes: Iterable[object]) -> str:
         nodes = list(nodes)
         self.uses_ranges = False
+        self.uses_math = False
+        self.uses_translate_helper = False
+        self.uses_projection = False
         self.uses_assert_helper = False
         self.uses_echo_helper = False
         self.fixmes = []
@@ -134,42 +140,94 @@ class _Translator:
         }
         statements: list[str] = []
         models: list[str] = []
+        saw_model = False
+        last_statement_is_model = False
 
         for node in nodes:
             if isinstance(node, Assignment):
-                statements.append(f"{node.name.name} = {self.expression(node.expr)}")
+                value = self.expression(node.expr)
+                if node.name.name == "$fn":
+                    statements.append(f"Config.set_default_segments(int({value}))")
+                elif node.name.name.startswith("$"):
+                    statements.append(
+                        f"# UNSUPPORTED: {node.name.name} = {value}"
+                    )
+                else:
+                    statements.append(f"{node.name.name} = {value}")
+                last_statement_is_model = False
             elif isinstance(node, ModuleDeclaration):
                 statements.extend(self.module_declaration(node))
+                last_statement_is_model = False
             elif isinstance(node, FunctionDeclaration):
                 statements.extend(self.function_declaration(node))
+                last_statement_is_model = False
             elif isinstance(node, ModuleInstantiation):
                 if isinstance(node, ModularModifierDisable):
                     self.module_call(node)
+                    last_statement_is_model = False
                 elif isinstance(node, ModularEcho) and not node.children:
                     statements.append(self.module_call(node))
+                    last_statement_is_model = False
+                elif isinstance(node, ModularAssert) and not node.children:
+                    statements.append(self.module_call(node))
+                    last_statement_is_model = False
                 else:
-                    models.append(self.module_call(node))
+                    saw_model = True
+                    model = self.module_call(node)
+                    if model != "None":
+                        models.append(model)
+                        last_statement_is_model = True
+                    else:
+                        last_statement_is_model = False
             elif isinstance(node, (CommentLine, CommentSpan)):
-                text = getattr(node, "text", str(node)).strip()
-                statements.append(f"# {text.removeprefix('//').strip()}")
+                if (
+                    isinstance(node, CommentLine)
+                    and node.same_line
+                    and last_statement_is_model
+                    and models
+                ):
+                    suffix = (
+                        f"#{node.text}"
+                        if node.text.startswith((" ", "\t"))
+                        else f"# {node.text}"
+                    )
+                    models[-1] = f"{models[-1].rstrip()}  {suffix}"
+                else:
+                    self.append_comment(statements, node)
+                last_statement_is_model = False
             elif isinstance(node, BlankLine):
                 statements.append("")
+                last_statement_is_model = False
             elif isinstance(node, (IncludeStatement, UseStatement)):
                 statements.append(
                     f"pass  # FIXME: {_node_name(node)} {node.filepath.val!r} is not translated"
                 )
+                last_statement_is_model = False
             else:
                 statements.append(f"pass  # FIXME: {_node_name(node)} is not translated")
+                last_statement_is_model = False
 
-        if models:
+        if saw_model:
             model = models[0] if len(models) == 1 else f"union({', '.join(models)})"
+            if not models:
+                model = "None"
+            if self.uses_projection and models:
+                model = f"_scadtopy_combine_models([{', '.join(models)}])"
+            view_lines = (
+                [
+                    "    for _item in (_model if isinstance(_model, list) else [_model]):",
+                    "        view(_item)",
+                ]
+                if self.uses_projection
+                else ["    view(_model)"]
+            )
             statements.extend(
                 [
                     "",
                     f"_model = {model}",
                     "",
                     'if __name__ == "__main__":',
-                    "    view(_model)",
+                    *view_lines,
                     "    view_all_now()",
                 ]
             )
@@ -179,6 +237,8 @@ class _Translator:
         prefix = ""
         if self.uses_ranges:
             prefix = f"import math\n\n{_RANGE_HELPER}\n\n"
+        elif self.uses_math:
+            prefix = "import math\n\n"
         if self.uses_assert_helper:
             prefix += (
                 "def _scadtopy_assert(condition, message, value):\n"
@@ -211,7 +271,28 @@ class _Translator:
                 "    print('ECHO: ' + ', '.join(rendered))\n"
                 "    return result()\n\n"
             )
-        return prefix + "from piecad import *\n\n" + (body + "\n" if body else "")
+        prefix += "from piecad import *\n\n"
+        if self.uses_translate_helper:
+            prefix += (
+                "def _scadtopy_translate(geometry, vector):\n"
+                "    if isinstance(geometry, Obj2d) and len(vector) == 3:\n"
+                "        vector = vector[:2]\n"
+                "    return geometry.translate(vector)\n\n"
+            )
+        if self.uses_projection:
+            prefix += (
+                "def _scadtopy_combine_models(models):\n"
+                "    groups = [\n"
+                "        [model for model in models if isinstance(model, Obj3d)],\n"
+                "        [model for model in models if isinstance(model, Obj2d)],\n"
+                "    ]\n"
+                "    combined = [\n"
+                "        union(*group) if len(group) > 1 else group[0]\n"
+                "        for group in groups if group\n"
+                "    ]\n"
+                "    return combined[0] if len(combined) == 1 else combined\n\n"
+            )
+        return prefix + (body + "\n" if body else "")
 
     def module_declaration(self, node: ModuleDeclaration) -> list[str]:
         params = self.parameters(node.parameters)
@@ -220,7 +301,13 @@ class _Translator:
         geometry: list[str] = []
         for child in node.children:
             if isinstance(child, Assignment):
-                assignments.append(f"    {child.name.name} = {self.expression(child.expr)}")
+                value = self.expression(child.expr)
+                if child.name.name.startswith("$"):
+                    assignments.append(
+                        f"    # UNSUPPORTED: {child.name.name} = {value}"
+                    )
+                else:
+                    assignments.append(f"    {child.name.name} = {value}")
             elif isinstance(child, ModularEcho) and not child.children:
                 assignments.append(f"    {self.module_call(child)}")
             elif isinstance(child, ModuleInstantiation):
@@ -229,8 +316,10 @@ class _Translator:
                 lines.extend(f"    {line}" for line in self.function_declaration(child))
             elif isinstance(child, ModuleDeclaration):
                 lines.extend(f"    {line}" for line in self.module_declaration(child))
-            elif isinstance(child, (CommentLine, CommentSpan, BlankLine)):
-                continue
+            elif isinstance(child, (CommentLine, CommentSpan)):
+                self.append_comment(assignments, child, indent="    ")
+            elif isinstance(child, BlankLine):
+                assignments.append("")
             else:
                 assignments.append(f"    pass  # FIXME: {_node_name(child)} is not translated")
 
@@ -256,6 +345,27 @@ class _Translator:
                 else ""
             )
             for parameter in parameters
+        )
+
+    def append_comment(
+        self,
+        lines: list[str],
+        node: CommentLine | CommentSpan,
+        indent: str = "",
+    ) -> None:
+        if isinstance(node, CommentLine):
+            text = node.text
+            if node.same_line and lines and lines[-1]:
+                suffix = f"#{text}" if text.startswith((" ", "\t")) else f"# {text}"
+                lines[-1] = f"{lines[-1].rstrip()}  {suffix}"
+            else:
+                lines.append(f"{indent}#{text}")
+            return
+
+        text_lines = node.text.splitlines() or [""]
+        lines.extend(
+            f"{indent}# {text}" if text else f"{indent}#"
+            for text in text_lines
         )
 
     def assert_values(self, arguments: list[object], node: object) -> tuple[str, str]:
@@ -296,7 +406,9 @@ class _Translator:
             if isinstance(node, ModularModifierDisable):
                 self.module_call(node)
                 continue
-            geometries.append(self.module_call(node))
+            geometry = self.module_call(node)
+            if geometry != "None":
+                geometries.append(geometry)
         if not geometries:
             return "None"
         return self.combine(geometries)
@@ -355,12 +467,15 @@ class _Translator:
 
         name = node.name.name
         arguments = self.call_arguments(node.arguments)
-        children = self.module_list(node.children)
-        children = [
-            self.module_call(child)
-            for child in children
+        source_children = [
+            child
+            for child in self.module_list(node.children)
             if not isinstance(child, (CommentLine, CommentSpan, BlankLine))
         ]
+        children = [self.module_call(child) for child in source_children]
+        if source_children and all(child == "None" for child in children):
+            return "None"
+        children = [child for child in children if child != "None"]
 
         if name in _TRANSFORMS:
             if not children:
@@ -396,6 +511,36 @@ class _Translator:
             if node.arguments:
                 raise TranslationError(f"{name}() does not accept arguments{_position(node)}")
             return f"{_PIECAD_NAMES[name]}({', '.join(children)})"
+
+        if name == "minkowski":
+            if node.arguments:
+                raise TranslationError(f"minkowski() does not accept arguments{_position(node)}")
+            if len(children) < 2:
+                raise TranslationError(
+                    f"minkowski() requires at least two child geometries{_position(node)}"
+                )
+            result = children[0]
+            for child in children[1:]:
+                result = f"({result}).minkowski_sum({child})"
+            return result
+
+        if name == "projection":
+            self.uses_projection = True
+            if len(children) != 1:
+                raise TranslationError(
+                    f"projection() requires exactly one child geometry{_position(node)}"
+                )
+            self.reject_unexpected_named_arguments(node, {"cut"})
+            if len(node.arguments) > 1:
+                raise TranslationError(
+                    f"projection() accepts only the cut argument{_position(node)}"
+                )
+            cut = self.argument_value(node.arguments, ("cut",), 0)
+            cut = cut or "False"
+            return (
+                f"(({children[0]}).slice(0) "
+                f"if {cut} else ({children[0]}).project())"
+            )
 
         if name == "render":
             return self.combine(children) if children else "None"
@@ -441,10 +586,10 @@ class _Translator:
             if points is not None and faces is not None and len(node.arguments) <= 2:
                 triangles = (
                     f"[tuple(int(index) for index in "
-                    f"(face[0], face[i], face[i + 1])) "
+                    f"(face[0], face[i + 1], face[i])) "
                     f"for face in {faces} for i in range(1, len(face) - 1)]"
                 )
-                return f"polyhedron({points}, {triangles}, check='none')"
+                return f"polyhedron({points}, {triangles}, check='repair')"
             self.note_fixme(node, "polyhedron() requires points and faces")
             return "None"
 
@@ -480,11 +625,11 @@ class _Translator:
                 if points is None:
                     raise TranslationError(f"polygon() requires points{_position(node)}")
                 return (
-                    f"polygon([[{points}[int(index)] for index in path] "
+                    f"polygon([[{points}[int(index)] for index in reversed(path)] "
                     f"for path in {paths}])"
                 )
             if points is not None:
-                return f"polygon([{points}])"
+                return f"polygon([[point for point in reversed({points})]])"
             raise TranslationError(f"polygon() requires points{_position(node)}")
 
         if name == "children":
@@ -505,7 +650,8 @@ class _Translator:
             vector = self.argument_expression(node.arguments, ("v",), 0)
             if vector is None or len(node.arguments) != 1:
                 raise TranslationError(f"translate() requires one vector{_position(node)}")
-            return f"({geometry}).translate({self.expression(vector)})"
+            self.uses_translate_helper = True
+            return f"_scadtopy_translate(({geometry}), {self.expression(vector)})"
 
         if name == "scale":
             self.reject_unexpected_named_arguments(node, {"v"})
@@ -617,11 +763,11 @@ class _Translator:
     def cylinder(self, node: ModularCall) -> str:
         height = self.argument_value(node.arguments, ("h", "height"), 0)
         radius = self.argument_value(node.arguments, ("r", "radius"), 1)
-        r1 = self.argument_value(node.arguments, ("r1",), 1)
-        r2 = self.argument_value(node.arguments, ("r2",), 1)
-        diameter = self.argument_value(node.arguments, ("d", "diameter"), 1)
-        d1 = self.argument_value(node.arguments, ("d1",), 1)
-        d2 = self.argument_value(node.arguments, ("d2",), 1)
+        r1 = self.argument_value(node.arguments, ("r1",), -1)
+        r2 = self.argument_value(node.arguments, ("r2",), -1)
+        diameter = self.argument_value(node.arguments, ("d", "diameter"), -1)
+        d1 = self.argument_value(node.arguments, ("d1",), -1)
+        d2 = self.argument_value(node.arguments, ("d2",), -1)
         center = self.argument_value(node.arguments, ("center",), 2)
         segments = self.argument_value(node.arguments, ("$fn",), -1)
         if height is None:
@@ -658,7 +804,7 @@ class _Translator:
         if center is not None:
             keywords.append(f"center={center}")
         if r1 is not None:
-            return f"eliptical_cylinder({height}, ({r1}, {r2}){', ' if keywords else ''}{', '.join(keywords)})"
+            return f"elliptical_cylinder({height}, ({r1}, {r2}){', ' if keywords else ''}{', '.join(keywords)})"
         return f"cylinder({height}, {radius}{', ' if keywords else ''}{', '.join(keywords)})"
 
     def square(self, node: ModularCall) -> str:
@@ -850,6 +996,9 @@ class _Translator:
         if isinstance(node, CommentedExpr):
             return self.expression(node.expr)
         if isinstance(node, Identifier):
+            if node.name == "PI":
+                self.uses_math = True
+                return "math.pi"
             return node.name
         if isinstance(node, NumberLiteral):
             return repr(node.val)
@@ -886,9 +1035,16 @@ class _Translator:
             if not isinstance(node.left, Identifier):
                 self.note_fixme(node, "calls through a non-identifier expression are not translated")
                 return "None"
-            return f"{node.left.name}({', '.join(self.call_arguments(node.arguments))})"
+            name = node.left.name
+            if name == "sqrt":
+                self.uses_math = True
+                name = "math.sqrt"
+            return f"{name}({', '.join(self.call_arguments(node.arguments))})"
         if isinstance(node, PrimaryIndex):
-            return f"{self.expression(node.left)}[{self.expression(node.index)}]"
+            return (
+                f"{self.expression(node.left)}"
+                f"[int({self.expression(node.index)})]"
+            )
         if isinstance(node, PrimaryMember):
             return f"{self.expression(node.left)}.{node.member.name}"
 
@@ -924,7 +1080,7 @@ class _Translator:
 def translate_file(source: str | Path) -> str:
     """Parse an OpenSCAD source file and return equivalent Piecad Python code."""
     path = Path(source)
-    nodes = getASTfromFile(str(path))
+    nodes = getASTfromFile(str(path), include_comments=True)
     if nodes is None:
         raise TranslationError(f"Could not parse OpenSCAD file: {path}")
     return _Translator().translate(nodes)

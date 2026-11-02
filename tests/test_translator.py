@@ -40,7 +40,8 @@ class TranslatorTests(unittest.TestCase):
 
         self.assertIn(
             "_model = difference(cube(1, center=True).scale([10.0, 20.0, 30.0]), "
-            "(sphere(radius=4.0, segments=32.0)).translate([1.0, 2.0, 3.0]))",
+            "_scadtopy_translate((sphere(radius=4.0, segments=32.0)), "
+            "[1.0, 2.0, 3.0]))",
             generated,
         )
         compile(generated, "<generated>", "exec")
@@ -65,18 +66,72 @@ class TranslatorTests(unittest.TestCase):
     def test_maps_diameters_and_centered_cylinders(self) -> None:
         circle = self.translate("circle(d=10, $fn=24);")
         cylinder = self.translate("cylinder(12, 3, true);")
+        tapered = self.translate("cylinder(h=12, r1=2, r2=4);")
 
         self.assertIn("_model = circle(radius=(10.0) / 2, segments=24.0)", circle)
         self.assertIn("_model = cylinder(12.0, 3.0, center=True)", cylinder)
+        self.assertIn("_model = elliptical_cylinder(12.0, (2.0, 4.0))", tapered)
+        self.assertNotIn("_model = eliptical_cylinder", cylinder)
         compile(circle, "<generated-circle>", "exec")
         compile(cylinder, "<generated-cylinder>", "exec")
+        compile(tapered, "<generated-tapered-cylinder>", "exec")
+
+    def test_top_level_fn_sets_piecad_default_segments(self) -> None:
+        generated = self.translate("$fn = 48; sphere(5);")
+
+        self.assertIn("Config.set_default_segments(int(48.0))", generated)
+        self.assertNotIn("$fn =", generated)
+        self.assertIn("_model = sphere(5.0)", generated)
+        compile(generated, "<generated-default-segments>", "exec")
+
+        from piecad import Config
+
+        original_segments = Config._default_segments
+        try:
+            exec(generated, {})
+            self.assertEqual(Config._default_segments, 48)
+        finally:
+            Config.set_default_segments(original_segments)
+
+    def test_warns_for_other_top_level_special_settings(self) -> None:
+        generated = self.translate("$fa = 3; $fs = 2; $preview = true; cube(1);")
+
+        self.assertIn("# UNSUPPORTED: $fa = 3.0", generated)
+        self.assertIn("# UNSUPPORTED: $fs = 2.0", generated)
+        self.assertIn("# UNSUPPORTED: $preview = True", generated)
+        self.assertNotIn("$fa =", generated.split("# UNSUPPORTED:", 1)[0])
+        compile(generated, "<generated-special-settings>", "exec")
+
+    def test_passes_through_comments_and_parser_blank_lines(self) -> None:
+        generated = self.translate(
+            "// header\n\n$fa = 3; // setting note\n\n"
+            "// paragraph one\n\n// paragraph two\ncube(1); // geometry note"
+        )
+
+        self.assertIn("# header", generated)
+        self.assertIn("# UNSUPPORTED: $fa = 3.0  # setting note", generated)
+        self.assertIn("# paragraph one", generated)
+        self.assertIn("# paragraph two", generated)
+        self.assertIn("_model = cube(1.0)  # geometry note", generated)
+        self.assertIn("# paragraph one\n\n# paragraph two", generated)
+        compile(generated, "<generated-comments>", "exec")
+
+    def test_passes_through_module_comments_and_blank_lines(self) -> None:
+        generated = self.translate(
+            "module shape() { // opening\n// first\n\n// second\ncube(1);\n}"
+        )
+
+        self.assertIn("# opening", generated)
+        self.assertIn("# first", generated)
+        self.assertIn("# second", generated)
+        compile(generated, "<generated-module-comments>", "exec")
 
     def test_translates_polygon_paths(self) -> None:
         generated = self.translate(
             "polygon(points=[[0,0],[2,0],[1,2]], paths=[[0,1,2]]);"
         )
 
-        self.assertIn("for index in path", generated)
+        self.assertIn("for index in reversed(path)", generated)
         self.assertIn("for path in [[0.0, 1.0, 2.0]]", generated)
         compile(generated, "<generated-polygon>", "exec")
         exec(generated, {})
@@ -250,14 +305,108 @@ class TranslatorTests(unittest.TestCase):
             """
             polyhedron(
                 points=[[0,0,0],[10,0,0],[0,10,0],[0,0,10]],
-                faces=[[0,2,1],[0,1,3],[0,3,2],[1,2,3]]
+                faces=[[0,1,2],[0,3,1],[0,2,3],[1,3,2]]
             );
             """
         )
 
+        self.assertIn("face[0], face[i + 1], face[i]", generated)
+        self.assertIn("check='repair'", generated)
         namespace: dict[str, object] = {}
         exec(generated, namespace)
         self.assertFalse(namespace["_model"].is_empty())
+        self.assertGreater(namespace["_model"].volume(), 0)
+
+    def test_translates_t_scad_geometry_end_to_end(self) -> None:
+        generated = self.translate(
+            """
+            $fn = 24;
+            pi2 = PI * 2;
+            function root(value) = sqrt(value);
+            assert(root(4) == 2);
+            translate([0, 0, 0])
+                linear_extrude(5)
+                    polygon(
+                        points=[[0,0],[20,0],[10,15]],
+                        paths=[[0,1,2]]
+                    );
+            translate([30, 0, 0])
+                polyhedron(
+                    points=[[0,0,0],[10,0,0],[0,10,0],[0,0,10]],
+                    faces=[[0,1,2],[0,3,1],[0,2,3],[1,3,2]]
+                );
+            translate([60, 0, 0]) cylinder(h=10, r1=1, r2=2);
+            translate([90, 0, 0]) minkowski() { cube(1); sphere(1); }
+            echo("done");
+            """
+        )
+
+        self.assertIn("math.pi", generated)
+        self.assertIn("math.sqrt(", generated)
+        self.assertIn(".minkowski_sum(", generated)
+        self.assertNotIn("child geometry for module 'minkowski'", generated)
+        self.assertIn("for index in reversed(path)", generated)
+        self.assertIn("face[i + 1], face[i]", generated)
+        self.assertIn("elliptical_cylinder(", generated)
+        compile(generated, "<generated-t-scad>", "exec")
+
+        output = io.StringIO()
+        namespace: dict[str, object] = {"__name__": "t_scad_test"}
+        from piecad import Config
+
+        original_segments = Config.get_default_segments()
+        try:
+            with redirect_stdout(output):
+                exec(generated, namespace)
+            model = namespace["_model"]
+            self.assertFalse(model.is_empty())
+            self.assertGreater(model.volume(), 0)
+        finally:
+            Config.set_default_segments(original_segments)
+
+        self.assertIn('ECHO: "done"', output.getvalue())
+
+    def test_translates_minkowski_with_piecad_method(self) -> None:
+        generated = self.translate("minkowski() { cube(1); sphere(1); };")
+
+        self.assertIn("_model = (cube(1.0)).minkowski_sum(sphere(1.0))", generated)
+        compile(generated, "<generated-minkowski>", "exec")
+
+        namespace: dict[str, object] = {}
+        exec(generated, namespace)
+        self.assertFalse(namespace["_model"].is_empty())
+
+    def test_translates_projection_shadow_and_cut(self) -> None:
+        shadow = self.translate("projection() cube(2);")
+        cut = self.translate("projection(cut=true) cube(2, center=true);")
+        translated = self.translate(
+            "translate([10, 20, 30]) projection() cube(2);"
+        )
+        mixed = self.translate("cube(1); projection() cube(2);")
+
+        self.assertIn(".project()", shadow)
+        self.assertIn(".slice(0)", cut)
+        self.assertIn("_scadtopy_translate", translated)
+        self.assertIn("_scadtopy_combine_models", mixed)
+        compile(shadow, "<generated-projection-shadow>", "exec")
+        compile(cut, "<generated-projection-cut>", "exec")
+        compile(translated, "<generated-projection-translated>", "exec")
+        compile(mixed, "<generated-projection-mixed>", "exec")
+
+        shadow_namespace: dict[str, object] = {}
+        translated_namespace: dict[str, object] = {}
+        mixed_namespace: dict[str, object] = {}
+        exec(shadow, shadow_namespace)
+        exec(translated, translated_namespace)
+        exec(mixed, mixed_namespace)
+        self.assertEqual(shadow_namespace["_model"].bounding_box(), (0, 0, 2, 2))
+        self.assertEqual(
+            translated_namespace["_model"].bounding_box(), (10, 20, 12, 22)
+        )
+        self.assertEqual(
+            [type(model).__name__ for model in mixed_namespace["_model"]],
+            ["Obj3d", "Obj2d"],
+        )
 
     def test_translates_piecad_boolean_and_transform_methods(self) -> None:
         generated = self.translate(
@@ -271,7 +420,7 @@ class TranslatorTests(unittest.TestCase):
             """
         )
 
-        self.assertIn(".translate([1.0, 0.0, 0.0])", generated)
+        self.assertIn("_scadtopy_translate((cube(1.0)), [1.0, 0.0, 0.0])", generated)
         self.assertIn(".rotate([0, 0, -(30.0)])", generated)
         self.assertIn(".scale([2.0, 2.0, 2.0])", generated)
         self.assertIn(".mirror((False, True, False))", generated)
