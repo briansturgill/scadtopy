@@ -365,6 +365,71 @@ test_value =
 echo(test_value);
 
 //--------------------------------------------------
+// Built-in Math Functions (trig is in degrees)
+//--------------------------------------------------
+
+trig_value = sin(30) + cos(60) + tan(45) + asin(0.5) + acos(0.5) + atan(1) + atan2(1, 1);
+math_value = floor(2.5) + ceil(1.2) + pow(2, 3) + ln(2) + log(10) + sqrt(16);
+vector_norm = norm([3, 4]);
+cross_3d = cross([1, 0, 0], [0, 1, 0]);
+cross_2d = cross([1, 0], [0, 1]);
+
+echo("trig", trig_value);
+echo("math", math_value, vector_norm, cross_3d, cross_2d);
+
+// A user function shadowing a built-in must not be translated as the built-in.
+function exp(x) = x * 2;
+echo("user exp", exp(3));
+
+//--------------------------------------------------
+// Children Selection
+//--------------------------------------------------
+
+module pick(i)
+{
+    children(i);
+}
+
+module count_children()
+{
+    echo("children", $children);
+    children([0:1]);
+}
+
+translate([0, 60, 0])
+pick(1)
+{
+    cube(5);
+    sphere(5);
+    cylinder(h=5, r=2);
+}
+
+translate([30, 60, 0])
+count_children()
+{
+    cube(4);
+    sphere(4);
+    cylinder(h=4, r=2);
+}
+
+//--------------------------------------------------
+// 2D Offsets, Alignment and Extrusion Options
+//--------------------------------------------------
+
+translate([0, 90, 0])
+linear_extrude(height=3, center=true)
+offset(delta=1, chamfer=true)
+square([8, 4]);
+
+translate([30, 90, 0])
+linear_extrude(height=2)
+text("Hi", size=5, halign="center", valign="center");
+
+translate([60, 90, 0])
+linear_extrude(height=10, twist=-90, slices=20, scale=0.5)
+square(6, center=true);
+
+//--------------------------------------------------
 // End
 //--------------------------------------------------
 

@@ -109,7 +109,6 @@ _TRANSFORMS = {
 # Piecad's trig functions use degrees like OpenSCAD, so they pass through unchanged.
 _MATH_FUNCTIONS = {
     "sqrt": "math.sqrt",
-    "pow": "math.pow",
     "floor": "math.floor",
     "ceil": "math.ceil",
     "ln": "math.log",
