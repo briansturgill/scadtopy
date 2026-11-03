@@ -16,7 +16,9 @@ from openscad_parser.ast.nodes import (
     ListComprehension,
     NumberLiteral,
 )
+from scadtopy import cli as main_module
 from scadtopy import translate_file
+from scadtopy.translator import TranslationError
 from scadtopy.cli import main
 from scadtopy.translator import _Translator
 
@@ -39,9 +41,8 @@ class TranslatorTests(unittest.TestCase):
         )
 
         self.assertIn(
-            "_model = difference(cube(1, center=True).scale([10.0, 20.0, 30.0]), "
-            "_scadtopy_translate((sphere(radius=4.0, segments=32.0)), "
-            "[1.0, 2.0, 3.0]))",
+            "difference(cube([10.0, 20.0, 30.0], center=True), "
+            "sphere(radius=4.0, segments=32.0).translate([1.0, 2.0, 3.0]))",
             generated,
         )
         compile(generated, "<generated>", "exec")
@@ -59,8 +60,8 @@ class TranslatorTests(unittest.TestCase):
 
         self.assertIn("size = 8.0", generated)
         self.assertIn("def box(width=size):", generated)
-        self.assertIn("return cube(1).scale([width, width, width])", generated)
-        self.assertIn("_model = box(12.0)", generated)
+        self.assertIn("return cube([width, width, width])", generated)
+        self.assertIn("box(12.0)", generated)
         compile(generated, "<generated>", "exec")
 
     def test_maps_diameters_and_centered_cylinders(self) -> None:
@@ -68,10 +69,10 @@ class TranslatorTests(unittest.TestCase):
         cylinder = self.translate("cylinder(12, 3, true);")
         tapered = self.translate("cylinder(h=12, r1=2, r2=4);")
 
-        self.assertIn("_model = circle(radius=(10.0) / 2, segments=24.0)", circle)
-        self.assertIn("_model = cylinder(12.0, 3.0, center=True)", cylinder)
-        self.assertIn("_model = elliptical_cylinder(12.0, (2.0, 4.0))", tapered)
-        self.assertNotIn("_model = eliptical_cylinder", cylinder)
+        self.assertIn("circle(radius=10.0 / 2, segments=24.0)", circle)
+        self.assertIn("cylinder(12.0, 3.0, center=True)", cylinder)
+        self.assertIn("elliptical_cylinder(12.0, (2.0, 4.0))", tapered)
+        self.assertNotIn("eliptical_cylinder", cylinder)
         compile(circle, "<generated-circle>", "exec")
         compile(cylinder, "<generated-cylinder>", "exec")
         compile(tapered, "<generated-tapered-cylinder>", "exec")
@@ -81,7 +82,7 @@ class TranslatorTests(unittest.TestCase):
 
         self.assertIn("Config.set_default_segments(int(48.0))", generated)
         self.assertNotIn("$fn =", generated)
-        self.assertIn("_model = sphere(5.0)", generated)
+        self.assertIn("sphere(5.0)", generated)
         compile(generated, "<generated-default-segments>", "exec")
 
         from piecad import Config
@@ -112,7 +113,7 @@ class TranslatorTests(unittest.TestCase):
         self.assertIn("# UNSUPPORTED: $fa = 3.0  # setting note", generated)
         self.assertIn("# paragraph one", generated)
         self.assertIn("# paragraph two", generated)
-        self.assertIn("_model = cube(1.0)  # geometry note", generated)
+        self.assertIn("_parts.append(cube(1.0))  # geometry note", generated)
         self.assertIn("# paragraph one\n\n# paragraph two", generated)
         compile(generated, "<generated-comments>", "exec")
 
@@ -275,7 +276,7 @@ class TranslatorTests(unittest.TestCase):
         output = io.StringIO()
         with redirect_stdout(output):
             exec(generated, namespace)
-        self.assertIsNotNone(namespace["_model"])
+        self.assertIsNotNone(namespace["_parts"][0])
         self.assertEqual(output.getvalue(), "ECHO: 1\n")
 
     def test_module_echo_prints_arguments_and_returns_child_geometry(self) -> None:
@@ -287,7 +288,7 @@ class TranslatorTests(unittest.TestCase):
             exec(generated, namespace)
 
         self.assertEqual(output.getvalue(), 'ECHO: "shape", count = 2\n')
-        self.assertEqual(namespace["_model"].bounding_box(), (0, 0, 0, 1, 1, 1))
+        self.assertEqual(namespace["_parts"][0].bounding_box(), (0, 0, 0, 1, 1, 1))
 
     def test_standalone_module_echo_does_not_create_a_model(self) -> None:
         generated = self.translate('echo("standalone");')
@@ -298,7 +299,7 @@ class TranslatorTests(unittest.TestCase):
             exec(generated, namespace)
 
         self.assertEqual(output.getvalue(), 'ECHO: "standalone"\n')
-        self.assertNotIn("_model", namespace)
+        self.assertEqual(namespace["_parts"], [])
 
     def test_translates_polyhedron_faces_for_piecad(self) -> None:
         generated = self.translate(
@@ -314,8 +315,8 @@ class TranslatorTests(unittest.TestCase):
         self.assertIn("check='repair'", generated)
         namespace: dict[str, object] = {}
         exec(generated, namespace)
-        self.assertFalse(namespace["_model"].is_empty())
-        self.assertGreater(namespace["_model"].volume(), 0)
+        self.assertFalse(namespace["_parts"][0].is_empty())
+        self.assertGreater(namespace["_parts"][0].volume(), 0)
 
     def test_translates_t_scad_geometry_end_to_end(self) -> None:
         generated = self.translate(
@@ -358,7 +359,7 @@ class TranslatorTests(unittest.TestCase):
         try:
             with redirect_stdout(output):
                 exec(generated, namespace)
-            model = namespace["_model"]
+            model = namespace["_parts"][0]
             self.assertFalse(model.is_empty())
             self.assertGreater(model.volume(), 0)
         finally:
@@ -394,7 +395,7 @@ class TranslatorTests(unittest.TestCase):
             namespace["first"](_children=[namespace["cube"](2)]).bounding_box(),
             (0, 0, 0, 2, 2, 2),
         )
-        self.assertFalse(namespace["_model"].is_empty())
+        self.assertFalse(namespace["_parts"][0].is_empty())
 
     def test_translates_children_selectors_and_count(self) -> None:
         generated = self.translate(
@@ -429,8 +430,8 @@ class TranslatorTests(unittest.TestCase):
         )
 
         self.assertNotIn("FIXME", generated)
-        self.assertIn('.offset(2.0, "round")', generated)
-        self.assertIn('.offset(1.0, "miter", 1000.0)', generated)
+        self.assertIn(".offset(2.0, 'round')", generated)
+        self.assertIn(".offset(1.0, 'miter', 1000.0)", generated)
         namespace: dict[str, object] = {}
         exec(generated, namespace)
         box = namespace["square"](10, center=True).offset(2, "round").bounding_box()
@@ -447,17 +448,145 @@ class TranslatorTests(unittest.TestCase):
         namespace: dict[str, object] = {}
         exec(generated, namespace)
         self.assertEqual(namespace["square_"](3), 9)
-        self.assertEqual(namespace["_model"].bounding_box()[3], 5.0)
+        self.assertEqual(namespace["_parts"][0].bounding_box()[3], 5.0)
+
+    def test_translates_twisted_linear_extrude_and_rotate_extrude(self) -> None:
+        generated = self.translate(
+            """
+            linear_extrude(height=10, twist=90, slices=10, scale=2) square(4, center=true);
+            translate([50,0,0]) rotate_extrude(angle=270) translate([15,0,0]) circle(2);
+            translate([0,50,0]) rotate_extrude() translate([5,0]) circle(1);
+            """
+        )
+
+        self.assertNotIn("FIXME", generated)
+        namespace: dict[str, object] = {}
+        exec(generated, namespace)
+        twisted = namespace["_scadtopy_linear_extrude"](
+            namespace["square"](4, center=True), 10, False, 90, 10, 1
+        )
+        self.assertAlmostEqual(twisted.bounding_box()[5], 10)
+        cw = namespace["_scadtopy_linear_extrude"](
+            namespace["rectangle"]([8, 2], center=True), 10, False, 90, 10, 1
+        )
+        ccw = namespace["_scadtopy_linear_extrude"](
+            namespace["rectangle"]([8, 2], center=True), 10, False, -90, 10, 1
+        )
+        # Opposite twist directions are mirror images across the X axis.
+        self.assertAlmostEqual(cw.bounding_box()[1], -ccw.bounding_box()[4], places=3)
+        self.assertFalse(namespace["_parts"][0].is_empty())
+
+    def test_translates_text_alignment(self) -> None:
+        generated = self.translate(
+            'text("Hig", size=10, halign="center", valign="top");\n'
+            'translate([0,20,0]) text("Hig", 10, halign="right", valign="bottom");\n'
+        )
+
+        self.assertNotIn("FIXME", generated)
+        namespace: dict[str, object] = {}
+        exec(generated, namespace)
+        helper = namespace["_scadtopy_text"]
+        box = helper("Hig", 10, "center", "top").bounding_box()
+        self.assertAlmostEqual(box[0], -box[2])
+        self.assertAlmostEqual(box[3], 0)
+        box = helper("Hig", 10, "right", "bottom").bounding_box()
+        self.assertAlmostEqual(box[2], 0)
+        self.assertAlmostEqual(box[1], 0)
+        plain = namespace["text"](size=10, text="Hig").bounding_box()
+        left = helper("Hig", 10, "left", "baseline").bounding_box()
+        self.assertEqual(plain, left)
+
+    def test_collects_each_part_for_viewing(self) -> None:
+        generated = self.translate("cube(1);\ntranslate([5,0,0]) sphere(2);\n")
+
+        self.assertIn("_parts = []", generated)
+        self.assertIn("view(_part)", generated)
+        namespace: dict[str, object] = {}
+        exec(generated, namespace)
+        parts = namespace["_parts"]
+        self.assertEqual(len(parts), 2)
+        self.assertEqual(parts[1].bounding_box()[0], 3.0)
+
+    def test_translate_of_2d_shape_drops_z_component(self) -> None:
+        generated = self.translate(
+            "translate([1,2,3]) square(2);\ntranslate([1,2,3]) cube(2);\n"
+        )
+
+        self.assertIn(".translate([1.0, 2.0])", generated)
+        self.assertIn("cube(2.0).translate([1.0, 2.0, 3.0])", generated)
+        namespace: dict[str, object] = {}
+        exec(generated, namespace)
+        self.assertEqual(len(namespace["_parts"]), 2)
+
+    def test_saves_3d_parts_to_3mf_and_skips_2d_parts(self) -> None:
+        pure = self.translate("cube(1); sphere(1);")
+        mixed = self.translate("cube(1); square(2);")
+
+        self.assertRegex(pure, r'save\("[^"]+\.3mf", union\(\*_parts\)\)')
+        self.assertRegex(mixed, r"union\(\*\[part for part in _parts if isinstance\(part, Obj3d\)\]\)")
+
+    def test_use_imports_translated_module_and_knows_its_modules(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            (Path(directory) / "lib.scad").write_text(
+                "module peg() { cube(1); }", encoding="utf-8"
+            )
+            main_file = Path(directory) / "main.scad"
+            main_file.write_text("use <lib.scad>\npeg();", encoding="utf-8")
+            generated = translate_file(main_file)
+
+        self.assertIn("from lib import *", generated)
+        self.assertIn("_parts.append(peg())", generated)
+
+    def test_include_is_expanded(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            (Path(directory) / "inc.scad").write_text("size = 3;", encoding="utf-8")
+            main_file = Path(directory) / "main.scad"
+            main_file.write_text("include <inc.scad>\ncube(size);", encoding="utf-8")
+            generated = translate_file(main_file)
+
+        self.assertIn("size = 3", generated)
+        self.assertNotIn("FIXME", generated)
+
+    def test_builtin_functions_map_to_piecad_and_math(self) -> None:
+        generated = self.translate(
+            "a = sin(30) + floor(2.5) + norm([3,4]);"
+            "c = cross([1,0,0],[0,1,0]); d = cross([1,0],[0,1]);"
+            "function ceil(x) = x; e = ceil(1.5);"
+        )
+
+        self.assertIn("sin(30.0)", generated)
+        self.assertIn("math.floor(2.5)", generated)
+        self.assertIn("math.hypot(*[3.0, 4.0])", generated)
+        self.assertIn("from piecad.lin_math import Vec2", generated)
+        self.assertIn("Vec3.cross(", generated)
+        self.assertIn("Vec2.cross([1.0, 0.0], [0.0, 1.0])[2]", generated)
+        self.assertIn("e = ceil(1.5)", generated)
+
+    def test_save_precedes_view(self) -> None:
+        generated = self.translate("cube(1);")
+        self.assertLess(generated.index("save("), generated.index("view("))
+
+    def test_cli_formats_output_with_black(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "shape.scad"
+            source.write_text("translate([1,2,3]) cube(1);", encoding="utf-8")
+            with redirect_stdout(io.StringIO()):
+                with patch("sys.argv", ["scadtopy", str(source)]):
+                    main_module.main()
+            generated = source.with_suffix(".py").read_text(encoding="utf-8")
+
+        self.assertIn('save("shape.3mf"', generated)
+        self.assertNotIn("'", generated)
 
     def test_translates_minkowski_with_piecad_method(self) -> None:
         generated = self.translate("minkowski() { cube(1); sphere(1); };")
 
-        self.assertIn("_model = (cube(1.0)).minkowski_sum(sphere(1.0))", generated)
+        self.assertIn("cube(1.0).minkowski_sum(sphere(1.0))", generated)
         compile(generated, "<generated-minkowski>", "exec")
 
         namespace: dict[str, object] = {}
         exec(generated, namespace)
-        self.assertFalse(namespace["_model"].is_empty())
+        self.assertFalse(namespace["_parts"][0].is_empty())
 
     def test_translates_projection_shadow_and_cut(self) -> None:
         shadow = self.translate("projection() cube(2);")
@@ -469,8 +598,8 @@ class TranslatorTests(unittest.TestCase):
 
         self.assertIn(".project()", shadow)
         self.assertIn(".slice(0)", cut)
-        self.assertIn("_scadtopy_translate", translated)
-        self.assertIn("_scadtopy_combine_models", mixed)
+        self.assertIn(".translate([10.0, 20.0])", translated)
+        self.assertNotIn("_scadtopy_combine_models", mixed)
         compile(shadow, "<generated-projection-shadow>", "exec")
         compile(cut, "<generated-projection-cut>", "exec")
         compile(translated, "<generated-projection-translated>", "exec")
@@ -482,12 +611,12 @@ class TranslatorTests(unittest.TestCase):
         exec(shadow, shadow_namespace)
         exec(translated, translated_namespace)
         exec(mixed, mixed_namespace)
-        self.assertEqual(shadow_namespace["_model"].bounding_box(), (0, 0, 2, 2))
+        self.assertEqual(shadow_namespace["_parts"][0].bounding_box(), (0, 0, 2, 2))
         self.assertEqual(
-            translated_namespace["_model"].bounding_box(), (10, 20, 12, 22)
+            translated_namespace["_parts"][0].bounding_box(), (10, 20, 12, 22)
         )
         self.assertEqual(
-            [type(model).__name__ for model in mixed_namespace["_model"]],
+            [type(model).__name__ for model in mixed_namespace["_parts"]],
             ["Obj3d", "Obj2d"],
         )
 
@@ -503,8 +632,8 @@ class TranslatorTests(unittest.TestCase):
             """
         )
 
-        self.assertIn("_scadtopy_translate((cube(1.0)), [1.0, 0.0, 0.0])", generated)
-        self.assertIn(".rotate([0, 0, -(30.0)])", generated)
+        self.assertIn("cube(1.0).translate([1.0, 0.0, 0.0])", generated)
+        self.assertIn(".rotate([0, 0, -30.0])", generated)
         self.assertIn(".scale([2.0, 2.0, 2.0])", generated)
         self.assertIn(".mirror((False, True, False))", generated)
         compile(generated, "<generated>", "exec")
@@ -522,9 +651,9 @@ class TranslatorTests(unittest.TestCase):
             """
         )
 
-        self.assertIn("_model = intersect(hull(", generated)
+        self.assertIn("intersect(hull(", generated)
         self.assertIn(
-            ".extrude(10.0).translate([0, 0, (-(10.0) / 2 if True else 0)])",
+            ".extrude(10.0).translate([0, 0, -10.0 / 2])",
             generated,
         )
         compile(generated, "<generated>", "exec")
@@ -541,14 +670,11 @@ class TranslatorTests(unittest.TestCase):
         generated = self.translate("bevel(2);")
 
         self.assertIn("OpenSCAD module 'bevel' has no Piecad mapping", generated)
-        self.assertIn("_model = None", generated)
+        self.assertIn("_parts = []", generated)
 
     def test_marks_unmapped_transform_parameters(self) -> None:
-        generated = self.translate("linear_extrude(height=5, twist=10) square(2);")
-
-        self.assertIn("pass  # FIXME: only height and center", generated)
-        self.assertIn("_model = None", generated)
-        compile(generated, "<generated-unsupported-extrusion>", "exec")
+        with self.assertRaisesRegex(TranslationError, "Unsupported linear_extrude"):
+            self.translate("linear_extrude(height=5, bogus=10) square(2);")
 
     def test_cli_writes_python_next_to_the_source(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -560,7 +686,7 @@ class TranslatorTests(unittest.TestCase):
                 self.assertEqual(main(), 0)
 
             generated = output.read_text(encoding="utf-8")
-            self.assertIn("_model = cube(5.0)", generated)
+            self.assertIn("cube(5.0)", generated)
             compile(generated, str(output), "exec")
 
 

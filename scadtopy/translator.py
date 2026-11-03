@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 from pathlib import Path
 from typing import Iterable
 
@@ -105,6 +106,17 @@ _TRANSFORMS = {
 }
 
 
+# Piecad's trig functions use degrees like OpenSCAD, so they pass through unchanged.
+_MATH_FUNCTIONS = {
+    "sqrt": "math.sqrt",
+    "pow": "math.pow",
+    "floor": "math.floor",
+    "ceil": "math.ceil",
+    "ln": "math.log",
+    "log": "math.log10",
+    "exp": "math.exp",
+}
+
 try:
     import piecad as _piecad
 
@@ -152,6 +164,53 @@ def _children_modules(nodes: Iterable[object]) -> set[str]:
     return names
 
 
+_TWO_D_CALLS = {"square", "circle", "polygon", "text", "offset", "projection"}
+_THREE_D_CALLS = {
+    "cube", "sphere", "cylinder", "polyhedron", "linear_extrude", "rotate_extrude",
+    "surface", "import",
+}
+
+
+def _is_2d(node: object) -> bool:
+    if isinstance(node, (list, tuple)):
+        return any(_is_2d(item) for item in node)
+    if isinstance(node, ModularCall):
+        if node.name.name in _TWO_D_CALLS:
+            return True
+        if node.name.name in _THREE_D_CALLS:
+            return False
+    return _is_2d(getattr(node, "children", None) or [])
+
+
+def _tidy(code: str) -> str:
+    """Drop redundant parentheses by round-tripping through the Python parser."""
+    try:
+        return ast.unparse(ast.parse(code, mode="eval"))
+    except SyntaxError:
+        return code
+
+
+def _first_two(code: str) -> str:
+    try:
+        tree = ast.parse(code, mode="eval").body
+    except SyntaxError:
+        return f"({code})[:2]"
+    if isinstance(tree, ast.List) and len(tree.elts) >= 2:
+        return ast.unparse(ast.List(elts=tree.elts[:2], ctx=ast.Load()))
+    return f"({code})[:2]"
+
+
+def _receiver(code: str) -> str:
+    """Parenthesize generated code only when it is not already a call chain."""
+    try:
+        tree = ast.parse(code, mode="eval").body
+    except SyntaxError:
+        return f"({code})"
+    if isinstance(tree, (ast.Call, ast.Name, ast.Attribute, ast.Subscript)):
+        return code
+    return f"({code})"
+
+
 def _position(node: object) -> str:
     position = getattr(node, "position", None)
     line = getattr(position, "line", None)
@@ -160,14 +219,18 @@ def _position(node: object) -> str:
 
 class _Translator:
     def __init__(self) -> None:
+        self.output_stem = ""
+        self.base_dir: Path | None = None
+        self.function_names: set[str] = set()
+        self.uses_vec2 = False
         self.module_names: set[str] = set()
         self.shadowing_names: set[str] = set()
         self.children_modules: set[str] = set()
         self.uses_children_helper = False
+        self.uses_linear_extrude_helper = False
+        self.uses_text_helper = False
         self.uses_ranges = False
         self.uses_math = False
-        self.uses_translate_helper = False
-        self.uses_projection = False
         self.uses_assert_helper = False
         self.uses_echo_helper = False
         self.fixmes: list[str] = []
@@ -185,16 +248,25 @@ class _Translator:
         }
         self.uses_ranges = False
         self.uses_math = False
-        self.uses_translate_helper = False
-        self.uses_projection = False
         self.uses_assert_helper = False
         self.uses_echo_helper = False
         self.fixmes = []
         self.uses_children_helper = False
+        self.uses_linear_extrude_helper = False
+        self.uses_text_helper = False
+        self.uses_vec2 = False
+        self.function_names = {
+            node.name.name for node in nodes if isinstance(node, FunctionDeclaration)
+        }
         self.module_names = _all_module_names(nodes)
         self.children_modules = _children_modules(nodes)
-        statements: list[str] = []
+        for node in nodes:
+            if isinstance(node, UseStatement):
+                self.load_used_names(node)
+        statements: list[str] = ["_parts = []"]
         models: list[str] = []
+        parts_2d: list[str] = []
+        parts_3d: list[str] = []
         saw_model = False
         last_statement_is_model = False
 
@@ -231,6 +303,8 @@ class _Translator:
                     model = self.module_call(node)
                     if model != "None":
                         models.append(model)
+                        (parts_2d if _is_2d(node) else parts_3d).append(model)
+                        statements.append(f"_parts.append({model})")
                         last_statement_is_model = True
                     else:
                         last_statement_is_model = False
@@ -239,23 +313,25 @@ class _Translator:
                     isinstance(node, CommentLine)
                     and node.same_line
                     and last_statement_is_model
-                    and models
                 ):
                     suffix = (
                         f"#{node.text}"
                         if node.text.startswith((" ", "\t"))
                         else f"# {node.text}"
                     )
-                    models[-1] = f"{models[-1].rstrip()}  {suffix}"
+                    statements[-1] = f"{statements[-1].rstrip()}  {suffix}"
                 else:
                     self.append_comment(statements, node)
                 last_statement_is_model = False
             elif isinstance(node, BlankLine):
                 statements.append("")
                 last_statement_is_model = False
-            elif isinstance(node, (IncludeStatement, UseStatement)):
+            elif isinstance(node, UseStatement):
+                statements.append(self.use_statement(node))
+                last_statement_is_model = False
+            elif isinstance(node, IncludeStatement):
                 statements.append(
-                    f"pass  # FIXME: {_node_name(node)} {node.filepath.val!r} is not translated"
+                    f"pass  # FIXME: include {node.filepath.val!r} was not expanded"
                 )
                 last_statement_is_model = False
             else:
@@ -263,26 +339,13 @@ class _Translator:
                 last_statement_is_model = False
 
         if saw_model:
-            model = models[0] if len(models) == 1 else f"union({', '.join(models)})"
-            if not models:
-                model = "None"
-            if self.uses_projection and models:
-                model = f"_scadtopy_combine_models([{', '.join(models)}])"
-            view_lines = (
-                [
-                    "    for _item in (_model if isinstance(_model, list) else [_model]):",
-                    "        view(_item)",
-                ]
-                if self.uses_projection
-                else ["    view(_model)"]
-            )
             statements.extend(
                 [
                     "",
-                    f"_model = {model}",
-                    "",
                     'if __name__ == "__main__":',
-                    *view_lines,
+                    *self.save_lines(bool(parts_3d), bool(parts_2d)),
+                    "    for _part in _parts:",
+                    "        view(_part)",
                     "    view_all_now()",
                 ]
             )
@@ -326,14 +389,10 @@ class _Translator:
                 "    print('ECHO: ' + ', '.join(rendered))\n"
                 "    return result()\n\n"
             )
-        prefix += "from piecad import *\n\n"
-        if self.uses_translate_helper:
-            prefix += (
-                "def _scadtopy_translate(geometry, vector):\n"
-                "    if isinstance(geometry, Obj2d) and len(vector) == 3:\n"
-                "        vector = vector[:2]\n"
-                "    return geometry.translate(vector)\n\n"
-            )
+        prefix += "from piecad import *\n"
+        if self.uses_vec2:
+            prefix += "from piecad.lin_math import Vec2\n"
+        prefix += "\n"
         if self.uses_children_helper:
             prefix += (
                 "def _scadtopy_children(children, selector=None):\n"
@@ -354,20 +413,89 @@ class _Translator:
                 "    return union(*picked) if len(picked) > 1 "
                 "else (picked[0] if picked else None)\n\n"
             )
-        if self.uses_projection:
+        if self.uses_text_helper:
             prefix += (
-                "def _scadtopy_combine_models(models):\n"
-                "    groups = [\n"
-                "        [model for model in models if isinstance(model, Obj3d)],\n"
-                "        [model for model in models if isinstance(model, Obj2d)],\n"
-                "    ]\n"
-                "    combined = [\n"
-                "        union(*group) if len(group) > 1 else group[0]\n"
-                "        for group in groups if group\n"
-                "    ]\n"
-                "    return combined[0] if len(combined) == 1 else combined\n\n"
+                "def _scadtopy_text(content, size, halign, valign):\n"
+                "    obj = text(size=size, text=content)\n"
+                "    min_x, min_y, max_x, max_y = obj.bounding_box()\n"
+                "    dx = {'left': 0, 'center': -(min_x + max_x) / 2, 'right': -max_x}[halign]\n"
+                "    dy = {\n"
+                "        'baseline': 0, 'top': -max_y,\n"
+                "        'center': -(min_y + max_y) / 2, 'bottom': -min_y,\n"
+                "    }[valign]\n"
+                "    return obj.translate([dx, dy])\n\n"
+            )
+        if self.uses_linear_extrude_helper:
+            prefix += (
+                "def _scadtopy_linear_extrude(obj, height, center, twist, slices, scale):\n"
+                "    if not isinstance(scale, (list, tuple)):\n"
+                "        scale = (scale, scale)\n"
+                "    divisions = int(slices) if slices else (\n"
+                "        max(1, math.ceil(abs(twist) / 360 * Config.get_default_segments()))\n"
+                "        if twist else 1\n"
+                "    )\n"
+                "    # Piecad twists counter-clockwise; OpenSCAD positive twist is clockwise.\n"
+                "    flip = twist > 0\n"
+                "    if flip:\n"
+                "        obj = obj.mirror((True, False))\n"
+                "    result = extrude_transforming(obj, height, divisions, abs(twist), tuple(scale))\n"
+                "    if flip:\n"
+                "        result = result.mirror((True, False, False))\n"
+                "    return result.translate([0, 0, -height / 2]) if center else result\n\n"
             )
         return prefix + (body + "\n" if body else "")
+
+    def cross(self, nodes: list[object], arguments: list[str]) -> str:
+        values = [getattr(argument, "expr", None) for argument in nodes]
+        if all(
+            isinstance(value, ListComprehension) and len(value.elements) == 2
+            for value in values
+        ):
+            self.uses_vec2 = True
+            return f"Vec2.cross({', '.join(arguments)})[2]"
+        return f"Vec3.cross({', '.join(arguments)})"
+
+    def used_nodes(self, node: UseStatement) -> list[object]:
+        if self.base_dir is None:
+            return []
+        path = self.base_dir / node.filepath.val
+        if not path.is_file():
+            return []
+        return getASTfromFile(str(path)) or []
+
+    def load_used_names(self, node: UseStatement) -> None:
+        nodes = self.used_nodes(node)
+        self.module_names |= _all_module_names(nodes)
+        self.children_modules |= _children_modules(nodes)
+        self.function_names |= {
+            declaration.name.name
+            for declaration in nodes
+            if isinstance(declaration, FunctionDeclaration)
+        }
+        self.shadowing_names |= {
+            declaration.name.name
+            for declaration in nodes
+            if isinstance(declaration, (FunctionDeclaration, ModuleDeclaration))
+            and declaration.name.name in _PIECAD_EXPORTS
+        }
+
+    def use_statement(self, node: UseStatement) -> str:
+        module = Path(node.filepath.val).stem
+        if not module.isidentifier():
+            return f"pass  # FIXME: cannot import {node.filepath.val!r} as a Python module"
+        return f"from {module} import *"
+
+    def save_lines(self, has_3d: bool, has_2d: bool) -> list[str]:
+        if not self.output_stem or not (has_3d or has_2d):
+            return []
+        if has_3d:
+            parts = (
+                "[part for part in _parts if isinstance(part, Obj3d)]"
+                if has_2d
+                else "_parts"
+            )
+            return [f'    save("{self.output_stem}.3mf", union(*{parts}))']
+        return [f'    save("{self.output_stem}.svg", union(*_parts))']
 
     def module_declaration(self, node: ModuleDeclaration) -> list[str]:
         params = self.parameters(node.parameters)
@@ -503,6 +631,9 @@ class _Translator:
         return f"{operation}(*[{value} {clauses}])"
 
     def module_call(self, node: object) -> str:
+        return _tidy(self._module_call(node))
+
+    def _module_call(self, node: object) -> str:
         if isinstance(node, ModularFor):
             return self.module_loop(node.assignments, node.body)
         if isinstance(node, ModularIntersectionFor):
@@ -565,24 +696,44 @@ class _Translator:
         if name == "linear_extrude":
             if not children:
                 raise TranslationError(f"linear_extrude() requires a child geometry{_position(node)}")
-            named_arguments = {
-                argument.name.name
-                for argument in node.arguments
-                if isinstance(argument, NamedArgument)
-            }
-            if named_arguments - {"height", "center"} or len(node.arguments) > 2:
-                self.note_fixme(
-                    node, "only height and center are mapped for linear_extrude()"
-                )
-                return "None"
+            self.reject_unexpected_named_arguments(
+                node, {"height", "center", "twist", "slices", "scale", "convexity", "$fn", "$fa", "$fs"}
+            )
             height = self.argument_value(node.arguments, ("height",), 0)
             if height is None:
                 raise TranslationError(f"linear_extrude() requires height{_position(node)}")
             center = self.argument_value(node.arguments, ("center",), 1)
-            extruded = f"({self.combine(children)}).extrude({height})"
-            if center is not None:
-                extruded += f".translate([0, 0, (-({height}) / 2 if {center} else 0)])"
-            return extruded
+            twist = self.argument_value(node.arguments, ("twist",), -1)
+            slices = self.argument_value(node.arguments, ("slices",), -1)
+            scale = self.argument_value(node.arguments, ("scale",), -1)
+            if twist is None and slices is None and scale is None:
+                extruded = f"{_receiver(self.combine(children))}.extrude({height})"
+                if center == "True":
+                    extruded += f".translate([0, 0, -({height}) / 2])"
+                elif center is not None and center != "False":
+                    extruded += f".translate([0, 0, (-({height}) / 2 if {center} else 0)])"
+                return _tidy(extruded)
+            self.uses_linear_extrude_helper = True
+            self.uses_math = True
+            return (
+                f"_scadtopy_linear_extrude({self.combine(children)}, {height}, "
+                f"{center or 'False'}, {twist or '0'}, {slices or 'None'}, {scale or '1'})"
+            )
+
+        if name == "rotate_extrude":
+            self.reject_unexpected_named_arguments(
+                node, {"angle", "convexity", "$fn", "$fa", "$fs"}
+            )
+            if not children:
+                return "None"
+            angle = self.argument_value(node.arguments, ("angle",), 0)
+            segments = self.argument_value(node.arguments, ("$fn",), -1)
+            extra = f", int({segments})" if segments is not None else ""
+            if extra and angle is None:
+                angle = "360.0"
+            if angle is None:
+                return f"revolve({self.combine(children)})"
+            return f"revolve({self.combine(children)}, {angle}{extra})"
 
         if name in _PIECAD_NAMES:
             if not children:
@@ -600,7 +751,7 @@ class _Translator:
                 )
             result = children[0]
             for child in children[1:]:
-                result = f"({result}).minkowski_sum({child})"
+                result = f"{_receiver(result)}.minkowski_sum({child})"
             return result
 
         if name == "offset":
@@ -616,15 +767,14 @@ class _Translator:
             geometry = self.combine(children)
             if delta is not None:
                 join = f'"square" if {chamfer} else "miter"' if chamfer else '"miter"'
-                call = f"({geometry}).offset({delta}, {join}, 1000.0"
+                call = f"{_receiver(geometry)}.offset({delta}, {join}, 1000.0"
             else:
-                call = f'({geometry}).offset({radius or "1"}, "round"'
+                call = f'{_receiver(geometry)}.offset({radius or "1"}, "round"'
             if segments is not None and delta is None:
                 call += f", segments=int({segments})"
             return call + ")"
 
         if name == "projection":
-            self.uses_projection = True
             if len(children) != 1:
                 raise TranslationError(
                     f"projection() requires exactly one child geometry{_position(node)}"
@@ -636,9 +786,12 @@ class _Translator:
                 )
             cut = self.argument_value(node.arguments, ("cut",), 0)
             cut = cut or "False"
+            if cut in ("True", "False"):
+                method = "slice(0)" if cut == "True" else "project()"
+                return f"{_receiver(children[0])}.{method}"
             return (
-                f"(({children[0]}).slice(0) "
-                f"if {cut} else ({children[0]}).project())"
+                f"({_receiver(children[0])}.slice(0) "
+                f"if {cut} else {_receiver(children[0])}.project())"
             )
 
         if name == "render":
@@ -658,25 +811,32 @@ class _Translator:
                     self.note_fixme(node, "only RGB/RGBA color vectors are supported")
                     return children[0]
                 rgb = ", ".join(f"round(({value}) * 255)" for value in values[:3])
-                return f"({children[0]}).color(({rgb}))"
-            return f"({children[0]}).color({self.expression(color)})"
+                return f"{_receiver(children[0])}.color(({rgb}))"
+            return f"{_receiver(children[0])}.color({self.expression(color)})"
         if name == "text":
             self.reject_children(node, children)
             text = self.argument_value(node.arguments, ("text",), 0)
             size = self.argument_value(node.arguments, ("size",), 1)
+            halign = self.argument_value(node.arguments, ("halign",), -1)
+            valign = self.argument_value(node.arguments, ("valign",), -1)
             unsupported_arguments = {
                 argument.name.name
                 for argument in node.arguments
                 if isinstance(argument, NamedArgument)
-            } - {"text", "size"}
-            if (
-                text is not None
-                and not unsupported_arguments
-                and len(node.arguments) <= 2
-            ):
+            } - {"text", "size", "halign", "valign"}
+            positional = [a for a in node.arguments if not isinstance(a, NamedArgument)]
+            if text is not None and not unsupported_arguments and len(positional) <= 2:
                 size = size or "10"
-                return f"text(size={size}, text={text})"
-            self.note_fixme(node, "text() supports only text and size in Piecad")
+                if halign is None and valign is None:
+                    return f"text(size={size}, text={text})"
+                self.uses_text_helper = True
+                return (
+                    f"_scadtopy_text({text}, {size}, "
+                    f"{halign or repr('left')}, {valign or repr('baseline')})"
+                )
+            self.note_fixme(
+                node, "text() supports only text, size, halign and valign in Piecad"
+            )
             return "None"
         if name == "polyhedron":
             self.reject_children(node, children)
@@ -756,8 +916,10 @@ class _Translator:
             vector = self.argument_expression(node.arguments, ("v",), 0)
             if vector is None or len(node.arguments) != 1:
                 raise TranslationError(f"translate() requires one vector{_position(node)}")
-            self.uses_translate_helper = True
-            return f"_scadtopy_translate(({geometry}), {self.expression(vector)})"
+            rendered = self.expression(vector)
+            if _is_2d(node.children):
+                rendered = _first_two(rendered)
+            return f"{_receiver(geometry)}.translate({rendered})"
 
         if name == "scale":
             self.reject_unexpected_named_arguments(node, {"v"})
@@ -767,7 +929,7 @@ class _Translator:
             rendered = self.expression(factors)
             if not isinstance(factors, ListComprehension):
                 rendered = f"[{rendered}, {rendered}, {rendered}]"
-            return f"({geometry}).scale({rendered})"
+            return f"{_receiver(geometry)}.scale({rendered})"
 
         if name == "rotate":
             self.reject_unexpected_named_arguments(node, {"a", "v"})
@@ -795,7 +957,7 @@ class _Translator:
                 sign = "-" if axis_values[axis_index] < 0 else ""
                 angles_list[axis_index] = f"{sign}({rendered_angle})"
                 angles = f"[{', '.join(angles_list)}]"
-            return f"({geometry}).rotate({angles})"
+            return f"{_receiver(geometry)}.rotate({angles})"
 
         if name == "mirror":
             self.reject_unexpected_named_arguments(node, {"v"})
@@ -806,7 +968,7 @@ class _Translator:
             if axis_values is None:
                 return "None"
             flags = [str(value != 0) for value in axis_values]
-            return f"({geometry}).mirror(({', '.join(flags)}))"
+            return f"{_receiver(geometry)}.mirror(({', '.join(flags)}))"
 
         raise AssertionError(f"Missing transform mapping for {name}")
 
@@ -861,10 +1023,8 @@ class _Translator:
         center = self.argument_value(node.arguments, ("center",), 1)
         if size is None:
             raise TranslationError(f"cube() requires size{_position(node)}")
-        if self.is_vector_expression(node.arguments, ("size",), 0):
-            centered = f", center={center}" if center is not None else ""
-            return f"cube(1{centered}).scale({size})"
-        return f"cube({size}{f', center={center}' if center is not None else ''})"
+        centered = f", center={center}" if center is not None else ""
+        return f"cube({size}{centered})"
 
     def cylinder(self, node: ModularCall) -> str:
         height = self.argument_value(node.arguments, ("h", "height"), 0)
@@ -923,7 +1083,7 @@ class _Translator:
             raise TranslationError(f"square() requires size{_position(node)}")
         centered = f", center={center}" if center is not None else ""
         if self.is_vector_expression(node.arguments, ("size",), 0):
-            return f"square(1{centered}).scale({size})"
+            return f"rectangle({size}{centered})"
         return f"square({size}{centered})"
 
     def primitive_call(
@@ -1099,6 +1259,9 @@ class _Translator:
         return self.expression(element)
 
     def expression(self, node: object) -> str:
+        return _tidy(self._expression(node))
+
+    def _expression(self, node: object) -> str:
         if isinstance(node, CommentedExpr):
             return self.expression(node.expr)
         if isinstance(node, Identifier):
@@ -1144,11 +1307,20 @@ class _Translator:
                 self.note_fixme(node, "calls through a non-identifier expression are not translated")
                 return "None"
             name = node.left.name
-            if name == "sqrt":
-                self.uses_math = True
-                name = "math.sqrt"
-            return f"{self.py_name(name)}({', '.join(self.call_arguments(node.arguments))})"
+            arguments = self.call_arguments(node.arguments)
+            if name not in self.function_names:
+                if name in _MATH_FUNCTIONS:
+                    self.uses_math = True
+                    return f"{_MATH_FUNCTIONS[name]}({', '.join(arguments)})"
+                if name == "norm" and len(arguments) == 1:
+                    self.uses_math = True
+                    return f"math.hypot(*{arguments[0]})"
+                if name == "cross" and len(node.arguments) == 2:
+                    return self.cross(node.arguments, arguments)
+            return f"{self.py_name(name)}({', '.join(arguments)})"
         if isinstance(node, PrimaryIndex):
+            if isinstance(node.index, NumberLiteral) and float(node.index.val).is_integer():
+                return f"{self.expression(node.left)}[{int(node.index.val)}]"
             return (
                 f"{self.expression(node.left)}"
                 f"[int({self.expression(node.index)})]"
@@ -1188,7 +1360,10 @@ class _Translator:
 def translate_file(source: str | Path) -> str:
     """Parse an OpenSCAD source file and return equivalent Piecad Python code."""
     path = Path(source)
-    nodes = getASTfromFile(str(path), include_comments=True)
+    nodes = getASTfromFile(str(path), include_comments=True, process_includes=True)
     if nodes is None:
         raise TranslationError(f"Could not parse OpenSCAD file: {path}")
-    return _Translator().translate(nodes)
+    translator = _Translator()
+    translator.output_stem = path.stem
+    translator.base_dir = path.resolve().parent
+    return translator.translate(nodes)

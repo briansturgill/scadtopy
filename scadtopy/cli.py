@@ -9,6 +9,17 @@ from pathlib import Path
 from .translator import TranslationError, translate_file
 
 
+def _format(source: str) -> str:
+    try:
+        import black
+    except ImportError:
+        return source
+    try:
+        return black.format_str(source, mode=black.Mode())
+    except black.InvalidInput:
+        return source
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         prog="scadtopy",
@@ -25,7 +36,7 @@ def main() -> int:
     output = args.output or args.source.with_suffix(".py")
 
     try:
-        python_source = translate_file(args.source)
+        python_source = _format(translate_file(args.source))
         output.write_text(python_source, encoding="utf-8")
     except (OSError, TranslationError) as error:
         print(f"scadtopy: {error}", file=sys.stderr)
