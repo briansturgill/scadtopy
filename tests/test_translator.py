@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import tempfile
 import unittest
+import warnings
 from contextlib import redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
@@ -31,37 +32,45 @@ class TranslatorTests(unittest.TestCase):
             return translate_file(path)
 
     def test_translates_primitives_transforms_and_boolean_operations(self) -> None:
-        generated = self.translate(
-            """
+        generated = self.translate("""
             difference() {
                 cube([10, 20, 30], center=true);
                 translate([1, 2, 3]) sphere(r=4, $fn=32);
             }
-            """
-        )
+            """)
 
         self.assertIn(
             "difference(cube([10.0, 20.0, 30.0], center=True), "
-            "sphere(radius=4.0, segments=32.0).translate([1.0, 2.0, 3.0]))",
+            "_scadtopy_translate(sphere(radius=4.0, "
+            "segments=_scadtopy_segments("
+            "4.0, int(32.0), _scadtopy_default_fa, _scadtopy_default_fs)), "
+            "[1.0, 2.0, 3.0]))",
             generated,
         )
         compile(generated, "<generated>", "exec")
 
     def test_translates_modules_and_variables(self) -> None:
-        generated = self.translate(
-            """
+        generated = self.translate("""
             size = 8;
             module box(width=size) {
                 cube([width, width, width]);
             }
             box(12);
-            """
-        )
+            """)
 
         self.assertIn("size = 8.0", generated)
-        self.assertIn("def box(width=size):", generated)
+        self.assertIn(
+            "def box(width=size, _scadtopy_special_fn=0, "
+            "_scadtopy_special_fa=None, _scadtopy_special_fs=None):",
+            generated,
+        )
         self.assertIn("return cube([width, width, width])", generated)
-        self.assertIn("box(12.0)", generated)
+        self.assertIn(
+            "box(12.0, _scadtopy_special_fn=_scadtopy_default_fn, "
+            "_scadtopy_special_fa=_scadtopy_default_fa, "
+            "_scadtopy_special_fs=_scadtopy_default_fs)",
+            generated,
+        )
         compile(generated, "<generated>", "exec")
 
     def test_maps_diameters_and_centered_cylinders(self) -> None:
@@ -69,9 +78,21 @@ class TranslatorTests(unittest.TestCase):
         cylinder = self.translate("cylinder(12, 3, true);")
         tapered = self.translate("cylinder(h=12, r1=2, r2=4);")
 
-        self.assertIn("circle(radius=10.0 / 2, segments=24.0)", circle)
-        self.assertIn("cylinder(12.0, 3.0, center=True)", cylinder)
-        self.assertIn("elliptical_cylinder(12.0, (2.0, 4.0))", tapered)
+        self.assertIn(
+            "circle(radius=10.0 / 2, segments=_scadtopy_segments("
+            "10.0 / 2, int(24.0), _scadtopy_default_fa, _scadtopy_default_fs))",
+            circle,
+        )
+        self.assertIn(
+            "cylinder(12.0, 3.0, segments=_scadtopy_segments("
+            "3.0, _scadtopy_default_fn, _scadtopy_default_fa, "
+            "_scadtopy_default_fs), center=True)",
+            cylinder,
+        )
+        self.assertIn(
+            "elliptical_cylinder(12.0, (2.0, 4.0), segments=",
+            tapered,
+        )
         self.assertNotIn("eliptical_cylinder", cylinder)
         compile(circle, "<generated-circle>", "exec")
         compile(cylinder, "<generated-cylinder>", "exec")
@@ -80,9 +101,15 @@ class TranslatorTests(unittest.TestCase):
     def test_top_level_fn_sets_piecad_default_segments(self) -> None:
         generated = self.translate("$fn = 48; sphere(5);")
 
-        self.assertIn("Config.set_default_segments(int(48.0))", generated)
+        self.assertIn("_scadtopy_default_fn = int(48.0)", generated)
+        self.assertIn("Config.set_default_segments(_scadtopy_default_fn)", generated)
         self.assertNotIn("$fn =", generated)
-        self.assertIn("sphere(5.0)", generated)
+        self.assertIn(
+            "sphere(5.0, segments=_scadtopy_segments("
+            "5.0, _scadtopy_default_fn, _scadtopy_default_fa, "
+            "_scadtopy_default_fs))",
+            generated,
+        )
         compile(generated, "<generated-default-segments>", "exec")
 
         from piecad import Config
@@ -97,11 +124,118 @@ class TranslatorTests(unittest.TestCase):
     def test_warns_for_other_top_level_special_settings(self) -> None:
         generated = self.translate("$fa = 3; $fs = 2; $preview = true; cube(1);")
 
-        self.assertIn("# UNSUPPORTED: $fa = 3.0", generated)
-        self.assertIn("# UNSUPPORTED: $fs = 2.0", generated)
+        self.assertIn("Config.set_default_min_angle(3.0)", generated)
+        self.assertIn("Config.set_default_min_segment_length(2.0)", generated)
         self.assertIn("# UNSUPPORTED: $preview = True", generated)
-        self.assertNotIn("$fa =", generated.split("# UNSUPPORTED:", 1)[0])
+        self.assertNotIn("$fa =", generated)
         compile(generated, "<generated-special-settings>", "exec")
+
+    def test_comments_out_unsupported_openscad_special_variables(self) -> None:
+        generated = self.translate(
+            "a = $t; b = $preview; c = $vpr; d = $vpt; e = $vpd; "
+            "cube($t); translate($vpt) square(2);"
+        )
+
+        for variable in ("$t", "$preview", "$vpr", "$vpt", "$vpd"):
+            self.assertIn(f"# UNSUPPORTED: {variable} are not translated", generated)
+        self.assertNotIn("cube($t)", generated)
+        self.assertNotIn("translate($vpt)", generated)
+        compile(generated, "<generated-unsupported-specials>", "exec")
+
+    def test_comments_out_unsupported_special_variables_in_definitions(self) -> None:
+        generated = self.translate(
+            "function animation() = $t; "
+            "module animated() { cube($preview); sphere(1); } "
+            "module with_default(value=$vpr) { cube(1); }"
+        )
+
+        self.assertIn(
+            "def animation(*args, **kwargs):\n"
+            "    # UNSUPPORTED: $t are not translated\n"
+            "    return None",
+            generated,
+        )
+        self.assertIn("# UNSUPPORTED: $preview are not translated", generated)
+        self.assertNotIn("cube($preview)", generated)
+        self.assertIn(
+            "def with_default(*args, **kwargs):\n"
+            "    # UNSUPPORTED: $vpr are not translated\n"
+            "    return None",
+            generated,
+        )
+        compile(generated, "<generated-unsupported-special-definitions>", "exec")
+
+    def test_calculates_segments_from_min_angle_and_segment_length(self) -> None:
+        generated = self.translate(
+            "$fa=6; $fs=1; function min_angle()=$fa; "
+            "sphere(r=5, $fn=0, $fa=min_angle(), $fs=$fs);"
+        )
+
+        self.assertIn("def min_angle():\n    return _scadtopy_default_fa", generated)
+        self.assertIn(
+            "segments=_scadtopy_segments("
+            "5.0, int(0.0), min_angle(), _scadtopy_default_fs)",
+            generated,
+        )
+        namespace: dict[str, object] = {}
+        from piecad import Config
+
+        original_angle = Config.get_default_min_angle()
+        original_length = Config.get_default_min_segment_length()
+        try:
+            exec(generated, namespace)
+            self.assertGreater(namespace["_parts"][0].num_verts(), 0)
+            self.assertEqual(Config.calculate_default_segments(5, 6, 1), 32)
+        finally:
+            Config.set_default_min_angle(original_angle)
+            Config.set_default_min_segment_length(original_length)
+
+    def test_scoped_segment_settings_in_modules(self) -> None:
+        generated = self.translate(
+            "module lowres() { $fn=0; $fa=6; $fs=1; sphere(5); } lowres();"
+        )
+
+        self.assertIn(
+            "def lowres(_scadtopy_special_fn=0, _scadtopy_special_fa=None, "
+            "_scadtopy_special_fs=None):",
+            generated,
+        )
+        self.assertIn("    _scadtopy_default_fn = int(0.0)", generated)
+        self.assertIn("    _scadtopy_default_fa = 6.0", generated)
+        self.assertIn("    _scadtopy_default_fs = 1.0", generated)
+        self.assertIn(
+            "_scadtopy_segments(5.0, _scadtopy_default_fn, "
+            "_scadtopy_default_fa, _scadtopy_default_fs)",
+            generated,
+        )
+        namespace: dict[str, object] = {}
+        exec(generated, namespace)
+        self.assertGreater(namespace["_parts"][0].num_verts(), 0)
+
+    def test_passes_segment_settings_through_user_modules(self) -> None:
+        generated = self.translate(
+            "module part() { sphere(2); } "
+            "module wrapper() { part(); } "
+            "wrapper($fn=8, $fa=6, $fs=1);"
+        )
+
+        self.assertIn("_scadtopy_special_fn=0", generated)
+        self.assertIn("_scadtopy_special_fa=None", generated)
+        self.assertIn("_scadtopy_special_fs=None", generated)
+        self.assertIn(
+            "wrapper(_scadtopy_special_fn=int(8.0), _scadtopy_special_fa=6.0, "
+            "_scadtopy_special_fs=1.0)",
+            generated,
+        )
+        self.assertIn(
+            "part(_scadtopy_special_fn=_scadtopy_default_fn, "
+            "_scadtopy_special_fa=_scadtopy_default_fa, "
+            "_scadtopy_special_fs=_scadtopy_default_fs)",
+            generated,
+        )
+        namespace: dict[str, object] = {}
+        exec(generated, namespace)
+        self.assertGreater(namespace["_parts"][0].num_verts(), 0)
 
     def test_passes_through_comments_and_parser_blank_lines(self) -> None:
         generated = self.translate(
@@ -110,7 +244,7 @@ class TranslatorTests(unittest.TestCase):
         )
 
         self.assertIn("# header", generated)
-        self.assertIn("# UNSUPPORTED: $fa = 3.0  # setting note", generated)
+        self.assertIn("Config.set_default_min_angle(3.0)  # setting note", generated)
         self.assertIn("# paragraph one", generated)
         self.assertIn("# paragraph two", generated)
         self.assertIn("_parts.append(cube(1.0))  # geometry note", generated)
@@ -138,15 +272,13 @@ class TranslatorTests(unittest.TestCase):
         exec(generated, {})
 
     def test_translates_inclusive_range_literals(self) -> None:
-        generated = self.translate(
-            """
+        generated = self.translate("""
             implicit = [1:3];
             ascending = [0:2:6];
             descending = [3:-1:0];
             fractional = [0:0.1:0.3];
             empty = [5:0];
-            """
-        )
+            """)
 
         namespace: dict[str, object] = {}
         exec(generated, namespace)
@@ -157,20 +289,41 @@ class TranslatorTests(unittest.TestCase):
         self.assertEqual(namespace["empty"], [])
 
     def test_translates_functions_let_assert_and_function_literals(self) -> None:
-        generated = self.translate(
-            """
+        generated = self.translate("""
             function twice(value=2) = value * 2;
             result = let(base=twice()) base + 1;
             callback = function(value) value + 3;
             checked = assert(result == 5) callback(4);
-            """
-        )
+            """)
 
         namespace: dict[str, object] = {}
         exec(generated, namespace)
         self.assertEqual(namespace["result"], 5.0)
         self.assertEqual(namespace["checked"], 7.0)
         self.assertEqual(namespace["callback"](2), 5)
+
+    def test_calls_through_callable_expressions(self) -> None:
+        generated = self.translate("""
+            functions = [function(x, y=2) x + y, function(x) x * 2];
+            function make() = function(x) x + 1;
+            indexed = functions[0](x=3);
+            dynamic = functions[1 + 0](4);
+            returned = make()(5);
+            conditional = (true ? functions[0] : functions[1])(6);
+            indexed_conditional = (true ? [functions[0]] : [functions[1]])[0](8);
+            literal = (function(x) x * 3)(7);
+            """)
+
+        self.assertNotIn("FIXME", generated)
+        compile(generated, "<generated-callables>", "exec")
+        namespace: dict[str, object] = {}
+        exec(generated, namespace)
+        self.assertEqual(namespace["indexed"], 5)
+        self.assertEqual(namespace["dynamic"], 8)
+        self.assertEqual(namespace["returned"], 6)
+        self.assertEqual(namespace["conditional"], 8)
+        self.assertEqual(namespace["indexed_conditional"], 10)
+        self.assertEqual(namespace["literal"], 21)
 
     def test_expression_assertion_is_lazy_and_fails_explicitly(self) -> None:
         generated = self.translate("result = assert(false) missing_function();")
@@ -179,9 +332,7 @@ class TranslatorTests(unittest.TestCase):
             exec(generated, {})
 
     def test_expression_echo_prints_arguments_and_returns_body_value(self) -> None:
-        generated = self.translate(
-            'result = echo("number", 3, status=true) 7;'
-        )
+        generated = self.translate('result = echo("number", 3, status=true) 7;')
 
         output = io.StringIO()
         namespace: dict[str, object] = {}
@@ -192,13 +343,11 @@ class TranslatorTests(unittest.TestCase):
         self.assertEqual(namespace["result"], 7.0)
 
     def test_translates_list_comprehension_loops_and_conditions(self) -> None:
-        generated = self.translate(
-            """
+        generated = self.translate("""
             doubled = [for(value=[0:3]) value * 2];
             even = [for(value=[0:4]) if(value % 2 == 0) value];
             selected = [if(true) 3 else 4];
-            """
-        )
+            """)
 
         namespace: dict[str, object] = {}
         exec(generated, namespace)
@@ -238,15 +387,13 @@ class TranslatorTests(unittest.TestCase):
         compile(generated, "<generated-c-style-comprehension>", "exec")
 
     def test_translates_module_loops_conditionals_and_let(self) -> None:
-        generated = self.translate(
-            """
+        generated = self.translate("""
             module repeated(count) {
                 for(value=[0:count-1]) translate([value, 0, 0]) cube(1);
             }
             if(true) repeated(3); else sphere(1);
             let(size=2) cube(size);
-            """
-        )
+            """)
 
         compile(generated, "<generated-modules>", "exec")
         self.assertIn("union(*[", generated)
@@ -254,24 +401,20 @@ class TranslatorTests(unittest.TestCase):
         self.assertIn("lambda size:", generated)
 
     def test_translates_remaining_module_nodes_and_render_expression(self) -> None:
-        generated = self.translate(
-            """
+        generated = self.translate("""
             rendered = render() { cube(1); };
             echo(1) cube(2);
             assert(true) cube(3);
             intersection_for(i=[0:1]) translate([i, 0, 0]) cube(1);
             #sphere(1);
             %cube(1);
-            !cube(1);
             *cube(1);
-            """
-        )
+            """)
 
         compile(generated, "<generated-module-nodes>", "exec")
         self.assertIn("rendered = cube(1.0)", generated)
         self.assertNotIn("FIXME: module echo", generated)
-        self.assertIn("pass  # FIXME: display modifier", generated)
-        self.assertIn("pass  # FIXME: disabled geometry", generated)
+        self.assertNotIn("FIXME", generated)
         namespace: dict[str, object] = {}
         output = io.StringIO()
         with redirect_stdout(output):
@@ -302,14 +445,12 @@ class TranslatorTests(unittest.TestCase):
         self.assertEqual(namespace["_parts"], [])
 
     def test_translates_polyhedron_faces_for_piecad(self) -> None:
-        generated = self.translate(
-            """
+        generated = self.translate("""
             polyhedron(
                 points=[[0,0,0],[10,0,0],[0,10,0],[0,0,10]],
                 faces=[[0,1,2],[0,3,1],[0,2,3],[1,3,2]]
             );
-            """
-        )
+            """)
 
         self.assertIn("face[0], face[i + 1], face[i]", generated)
         self.assertIn("check='repair'", generated)
@@ -319,8 +460,7 @@ class TranslatorTests(unittest.TestCase):
         self.assertGreater(namespace["_parts"][0].volume(), 0)
 
     def test_translates_t_scad_geometry_end_to_end(self) -> None:
-        generated = self.translate(
-            """
+        generated = self.translate("""
             $fn = 24;
             pi2 = PI * 2;
             function root(value) = sqrt(value);
@@ -339,8 +479,7 @@ class TranslatorTests(unittest.TestCase):
             translate([60, 0, 0]) cylinder(h=10, r1=1, r2=2);
             translate([90, 0, 0]) minkowski() { cube(1); sphere(1); }
             echo("done");
-            """
-        )
+            """)
 
         self.assertIn("math.pi", generated)
         self.assertIn("math.sqrt(", generated)
@@ -368,8 +507,7 @@ class TranslatorTests(unittest.TestCase):
         self.assertIn('ECHO: "done"', output.getvalue())
 
     def test_translates_children_and_unions_module_bodies(self) -> None:
-        generated = self.translate(
-            """
+        generated = self.translate("""
             module repeated(count=3) {
                 for(i=[0:count-1]) translate([i*10,0,0]) children();
             }
@@ -378,10 +516,13 @@ class TranslatorTests(unittest.TestCase):
             repeated(3) { cube(1); sphere(1); }
             translate([0,20,0]) pair();
             translate([0,40,0]) first() { cube(2); sphere(5); }
-            """
-        )
+            """)
 
-        self.assertIn("def repeated(count=3.0, _children=()):", generated)
+        self.assertIn(
+            "def repeated(count=3.0, _scadtopy_special_fn=0, "
+            "_scadtopy_special_fa=None, _scadtopy_special_fs=None, _children=()):",
+            generated,
+        )
         self.assertIn("_children=[", generated)
         self.assertNotIn("children() substitution", generated)
         namespace: dict[str, object] = {}
@@ -398,16 +539,14 @@ class TranslatorTests(unittest.TestCase):
         self.assertFalse(namespace["_parts"][0].is_empty())
 
     def test_translates_children_selectors_and_count(self) -> None:
-        generated = self.translate(
-            """
+        generated = self.translate("""
             module pick() { children([0:1]); translate([20,0,0]) children([2]); }
             module count() { translate([0,0,$children]) children(0); }
             module outer() { module inner() { children(1); } inner() { cube(1); cube(3); } }
             pick() { cube(1); cube(2); cube(3); }
             count() { cube(1); cube(1); }
             outer();
-            """
-        )
+            """)
 
         self.assertNotIn("FIXME", generated)
         namespace: dict[str, object] = {}
@@ -422,15 +561,18 @@ class TranslatorTests(unittest.TestCase):
             namespace["_scadtopy_children"](kids, 7)
 
     def test_translates_offset_radial_and_delta(self) -> None:
-        generated = self.translate(
-            """
+        generated = self.translate("""
             offset(r=2) square([10,10],center=true);
             translate([30,0,0]) offset(delta=1) square(4);
-            """
-        )
+            """)
 
         self.assertNotIn("FIXME", generated)
-        self.assertIn(".offset(2.0, 'round')", generated)
+        self.assertIn(
+            ".offset(2.0, 'round', segments=_scadtopy_segments("
+            "2.0, _scadtopy_default_fn, _scadtopy_default_fa, "
+            "_scadtopy_default_fs))",
+            generated,
+        )
         self.assertIn(".offset(1.0, 'miter', 1000.0)", generated)
         namespace: dict[str, object] = {}
         exec(generated, namespace)
@@ -451,30 +593,64 @@ class TranslatorTests(unittest.TestCase):
         self.assertEqual(namespace["_parts"][0].bounding_box()[3], 5.0)
 
     def test_translates_twisted_linear_extrude_and_rotate_extrude(self) -> None:
-        generated = self.translate(
-            """
+        generated = self.translate("""
             linear_extrude(height=10, twist=90, slices=10, scale=2) square(4, center=true);
             translate([50,0,0]) rotate_extrude(angle=270) translate([15,0,0]) circle(2);
             translate([0,50,0]) rotate_extrude() translate([5,0]) circle(1);
-            """
-        )
+            """)
 
         self.assertNotIn("FIXME", generated)
         namespace: dict[str, object] = {}
         exec(generated, namespace)
         twisted = namespace["_scadtopy_linear_extrude"](
-            namespace["square"](4, center=True), 10, False, 90, 10, 1
+            namespace["square"](4, center=True), 10, False, 90, 10, 1, 0, 12, 2
         )
         self.assertAlmostEqual(twisted.bounding_box()[5], 10)
         cw = namespace["_scadtopy_linear_extrude"](
-            namespace["rectangle"]([8, 2], center=True), 10, False, 90, 10, 1
+            namespace["rectangle"]([8, 2], center=True), 10, False, 90, 10, 1, 0, 12, 2
         )
         ccw = namespace["_scadtopy_linear_extrude"](
-            namespace["rectangle"]([8, 2], center=True), 10, False, -90, 10, 1
+            namespace["rectangle"]([8, 2], center=True), 10, False, -90, 10, 1, 0, 12, 2
         )
         # Opposite twist directions are mirror images across the X axis.
         self.assertAlmostEqual(cw.bounding_box()[1], -ccw.bounding_box()[4], places=3)
         self.assertFalse(namespace["_parts"][0].is_empty())
+
+    def test_linear_extrude_special_settings_apply_to_slices_and_profile(self) -> None:
+        generated = self.translate(
+            "module profile() { circle(2); } "
+            "linear_extrude(height=10, twist=360, $fn=12, $fa=6, $fs=1) "
+            "profile();"
+        )
+
+        self.assertIn(
+            "profile(_scadtopy_special_fn=int(12.0), _scadtopy_special_fa=6.0, "
+            "_scadtopy_special_fs=1.0)",
+            generated,
+        )
+        self.assertIn(
+            "_scadtopy_linear_extrude(profile",
+            generated,
+        )
+        self.assertIn("10.0, False, 360.0, None, 1, int(12.0), 6.0, 1.0)", generated)
+        namespace: dict[str, object] = {}
+        exec(generated, namespace)
+        self.assertGreater(namespace["_parts"][0].num_verts(), 0)
+
+    def test_rotate_extrude_uses_profile_radius_and_special_settings(self) -> None:
+        generated = self.translate(
+            "rotate_extrude($fa=6, $fs=1) " "translate([5,10]) circle(2);"
+        )
+
+        self.assertIn(
+            "max(abs(_scadtopy_profile.bounding_box()[0]), "
+            "abs(_scadtopy_profile.bounding_box()[2]))",
+            generated,
+        )
+        self.assertIn(
+            "_scadtopy_segments(max(abs(_scadtopy_profile",
+            generated,
+        )
 
     def test_translates_text_alignment(self) -> None:
         generated = self.translate(
@@ -512,18 +688,42 @@ class TranslatorTests(unittest.TestCase):
             "translate([1,2,3]) square(2);\ntranslate([1,2,3]) cube(2);\n"
         )
 
-        self.assertIn(".translate([1.0, 2.0])", generated)
-        self.assertIn("cube(2.0).translate([1.0, 2.0, 3.0])", generated)
+        self.assertIn("_scadtopy_translate(square(2.0), [1.0, 2.0, 3.0])", generated)
+        self.assertIn("_scadtopy_translate(cube(2.0), [1.0, 2.0, 3.0])", generated)
         namespace: dict[str, object] = {}
         exec(generated, namespace)
         self.assertEqual(len(namespace["_parts"]), 2)
 
-    def test_saves_3d_parts_to_3mf_and_skips_2d_parts(self) -> None:
-        pure = self.translate("cube(1); sphere(1);")
-        mixed = self.translate("cube(1); square(2);")
+    def test_translate_runtime_type_handles_user_modules_returning_2d(self) -> None:
+        generated = self.translate(
+            "module flat() square(2); translate([1, 2, 3]) flat();"
+        )
+        namespace: dict[str, object] = {}
+        exec(generated, namespace)
 
-        self.assertRegex(pure, r'save\("[^"]+\.3mf", union\(\*_parts\)\)')
-        self.assertRegex(mixed, r"union\(\*\[part for part in _parts if isinstance\(part, Obj3d\)\]\)")
+        model = namespace["_parts"][0]
+        self.assertEqual(model.bounding_box(), (1.0, 2.0, 3.0, 4.0))
+
+    def test_runtime_geometry_type_selects_auto_save_format(self) -> None:
+        cases = (
+            ("module flat() square(2); flat();", "model.svg"),
+            ("module solid() cube(2); solid();", "model.3mf"),
+            (
+                "module flat() square(2); module solid() cube(2); flat(); solid();",
+                "model.3mf",
+            ),
+        )
+        for source, expected_filename in cases:
+            with self.subTest(expected_filename=expected_filename, source=source):
+                generated = self.translate(source)
+                with (
+                    patch("piecad.save") as save,
+                    patch("piecad.view"),
+                    patch("piecad.view_all_now"),
+                ):
+                    exec(generated, {"__name__": "__main__"})
+
+                self.assertEqual(save.call_args.args[0], expected_filename)
 
     def test_use_imports_translated_module_and_knows_its_modules(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -535,7 +735,33 @@ class TranslatorTests(unittest.TestCase):
             generated = translate_file(main_file)
 
         self.assertIn("from lib import *", generated)
-        self.assertIn("_parts.append(peg())", generated)
+        self.assertIn(
+            "peg(_scadtopy_special_fn=_scadtopy_default_fn, "
+            "_scadtopy_special_fa=_scadtopy_default_fa, "
+            "_scadtopy_special_fs=_scadtopy_default_fs)",
+            generated,
+        )
+
+    def test_warns_about_use_and_import_paths_with_source_filename(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "main.scad"
+            source.write_text(
+                'use <lib.scad>;\nimport("assets/part.stl");', encoding="utf-8"
+            )
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always")
+                generated = translate_file(source)
+
+        self.assertEqual(len(caught), 2)
+        self.assertTrue(all(warning.filename == str(source) for warning in caught))
+        self.assertEqual([warning.lineno for warning in caught], [1, 2])
+        messages = [str(warning.message) for warning in caught]
+        self.assertIn("use <lib.scad>", messages[0])
+        self.assertIn("translate the used .scad file separately", messages[0])
+        self.assertIn('import("assets/part.stl")', messages[1])
+        self.assertIn("Python process working directory", messages[1])
+        self.assertIn("from lib import *", generated)
+        self.assertIn("load('assets/part.stl')", generated)
 
     def test_include_is_expanded(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -562,6 +788,101 @@ class TranslatorTests(unittest.TestCase):
         self.assertIn("Vec2.cross([1.0, 0.0], [0.0, 1.0])[2]", generated)
         self.assertIn("e = ceil(1.5)", generated)
 
+    def test_group_and_modifiers(self) -> None:
+        generated = self.translate(
+            "group() { cube(1); sphere(1); } *cube(5); #cube(2); %sphere(2);"
+        )
+
+        self.assertIn(
+            "_parts.append(union(cube(1.0), sphere(1.0, "
+            "segments=_scadtopy_segments(1.0, _scadtopy_default_fn, "
+            "_scadtopy_default_fa, _scadtopy_default_fs))))",
+            generated,
+        )
+        self.assertIn("_parts.append(cube(2.0))", generated)
+        self.assertIn(
+            "_parts.append(sphere(2.0, segments=_scadtopy_segments("
+            "2.0, _scadtopy_default_fn, _scadtopy_default_fa, "
+            "_scadtopy_default_fs)))",
+            generated,
+        )
+        self.assertNotIn("5.0", generated)
+        self.assertNotIn("FIXME", generated)
+
+    def test_show_only_modifier_is_fatal(self) -> None:
+        with self.assertRaisesRegex(
+            TranslationError, r"Show only \('!'\) is not allowed at line: 2"
+        ):
+            self.translate("cube(1);\n!cube(2);")
+
+    def test_easy_builtins(self) -> None:
+        generated = self.translate(
+            "a = is_undef(1); b = concat([1],[2]); c = round(2.5); d = sign(-1);"
+            'e = str(1, "x"); f = rands(0,1,2); g = lookup(1,[[0,0],[2,2]]);'
+        )
+
+        self.assertIn("a = 1.0 is None", generated)
+        self.assertIn("b = [1.0] + [2.0]", generated)
+        for helper in ("round", "sign", "str", "rands", "lookup"):
+            self.assertIn(f"def _scadtopy_{helper}(", generated)
+        self.assertIn("import random", generated)
+
+    def test_search_builtin_matches_openscad_search_forms(self) -> None:
+        generated = self.translate("""
+            first = search("a", "abcdabcd");
+            missing = search("z", "abcd");
+            all_chars = search("abc", "abcabc", 0);
+            query_list = search([2, 4, 8], [4, 2, 4], 0);
+            rows = search(9, [["a", 2], ["b", 9], ["c", 9]],
+                _num_returns_per_match_=0, _index_col_num_=1);
+            full_string = search(["abc"], ["abc", "a", "abc"]);
+            bool_search = search(true, [true, false]);
+            """)
+
+        self.assertIn("def _scadtopy_search(", generated)
+        compile(generated, "<generated-search>", "exec")
+        namespace: dict[str, object] = {}
+        exec(generated, namespace)
+        self.assertEqual(namespace["first"], [0])
+        self.assertEqual(namespace["missing"], [])
+        self.assertEqual(namespace["all_chars"], [[0, 3], [1, 4], [2, 5]])
+        self.assertEqual(namespace["query_list"], [[1], [0, 2], []])
+        self.assertEqual(namespace["rows"], [[1, 2]])
+        self.assertEqual(namespace["full_string"], [0])
+        self.assertIsNone(namespace["bool_search"])
+
+    def test_search_rejects_missing_duplicate_and_unknown_arguments(self) -> None:
+        with self.assertRaisesRegex(TranslationError, "requires match_value"):
+            self.translate("result = search([1, 2]);")
+        with self.assertRaisesRegex(TranslationError, "multiple values"):
+            self.translate("result = search([1], [1], 0, _num_returns_per_match_=0);")
+        with self.assertRaisesRegex(TranslationError, "Unsupported search"):
+            self.translate("result = search([1], [1], unknown=0);")
+
+    def test_import_maps_to_piecad_load_and_version_is_a_tuple(self) -> None:
+        generated = self.translate(
+            'import("part.stl"); import(file="part.3mf", convexity=2);'
+            'import("drawing.svg"); v = version();'
+        )
+
+        self.assertIn("_parts.append(load('part.stl'))", generated)
+        self.assertIn("_parts.append(load('part.3mf'))", generated)
+        self.assertIn("import() of .svg files is not supported", generated)
+        self.assertIn("v = tuple(map(int, version().split('.')))", generated)
+
+    def test_export_comment_saves_the_part_to_its_own_file(self) -> None:
+        generated = self.translate(
+            "cube(1);\ncube(2); // export PartA.stl\nsquare(3); // export Flat.svg\n"
+            "sphere(1); // not an export\ncube(4); // export Mesh.off\n"
+        )
+
+        self.assertIn("save('PartA.stl', _parts[1])", generated)
+        self.assertIn("save('Flat.svg', _parts[2])", generated)
+        self.assertIn("save('Mesh.off', _parts[4])", generated)
+        self.assertNotIn("_parts[0])", generated.replace("union(*_parts", ""))
+        self.assertNotIn("not an export'", generated.split("__main__")[1])
+        self.assertLess(generated.index("PartA.stl'"), generated.index("view("))
+
     def test_save_precedes_view(self) -> None:
         generated = self.translate("cube(1);")
         self.assertLess(generated.index("save("), generated.index("view("))
@@ -581,7 +902,12 @@ class TranslatorTests(unittest.TestCase):
     def test_translates_minkowski_with_piecad_method(self) -> None:
         generated = self.translate("minkowski() { cube(1); sphere(1); };")
 
-        self.assertIn("cube(1.0).minkowski_sum(sphere(1.0))", generated)
+        self.assertIn(
+            "cube(1.0).minkowski_sum(sphere(1.0, "
+            "segments=_scadtopy_segments(1.0, _scadtopy_default_fn, "
+            "_scadtopy_default_fa, _scadtopy_default_fs)))",
+            generated,
+        )
         compile(generated, "<generated-minkowski>", "exec")
 
         namespace: dict[str, object] = {}
@@ -591,14 +917,15 @@ class TranslatorTests(unittest.TestCase):
     def test_translates_projection_shadow_and_cut(self) -> None:
         shadow = self.translate("projection() cube(2);")
         cut = self.translate("projection(cut=true) cube(2, center=true);")
-        translated = self.translate(
-            "translate([10, 20, 30]) projection() cube(2);"
-        )
+        translated = self.translate("translate([10, 20, 30]) projection() cube(2);")
         mixed = self.translate("cube(1); projection() cube(2);")
 
         self.assertIn(".project()", shadow)
         self.assertIn(".slice(0)", cut)
-        self.assertIn(".translate([10.0, 20.0])", translated)
+        self.assertIn(
+            "_scadtopy_translate(cube(2.0).project(), [10.0, 20.0, 30.0])",
+            translated,
+        )
         self.assertNotIn("_scadtopy_combine_models", mixed)
         compile(shadow, "<generated-projection-shadow>", "exec")
         compile(cut, "<generated-projection-cut>", "exec")
@@ -621,26 +948,99 @@ class TranslatorTests(unittest.TestCase):
         )
 
     def test_translates_piecad_boolean_and_transform_methods(self) -> None:
-        generated = self.translate(
-            """
+        generated = self.translate("""
             union() {
                 translate(v=[1, 0, 0]) cube(1);
                 rotate(30, [0, 0, -1]) cube(1);
                 scale(2) cube(1);
                 mirror([0, 1, 0]) cube(1);
             }
-            """
-        )
+            """)
 
-        self.assertIn("cube(1.0).translate([1.0, 0.0, 0.0])", generated)
+        self.assertIn("_scadtopy_translate(cube(1.0), [1.0, 0.0, 0.0])", generated)
         self.assertIn(".rotate([0, 0, -30.0])", generated)
         self.assertIn(".scale([2.0, 2.0, 2.0])", generated)
         self.assertIn(".mirror((False, True, False))", generated)
         compile(generated, "<generated>", "exec")
 
-    def test_translates_centered_linear_extrusion_and_csg(self) -> None:
+    def test_translates_multmatrix_with_three_or_four_rows(self) -> None:
+        matrix_3x4 = self.translate(
+            "multmatrix([[1,0,0,10], [0,1,0,20], [0,0,1,30]]) cube(1);"
+        )
+        matrix_4x4 = self.translate(
+            "m = [[1,0,0,10], [0,1,0,20], [0,0,1,30], [9,8,7,6]]; "
+            "multmatrix(m=m) cube(1);"
+        )
+
+        self.assertIn(".transform([[1.0, 0.0, 0.0, 10.0]", matrix_3x4)
+        self.assertIn("[0.0, 0.0, 1.0, 30.0]][:3])", matrix_3x4)
+        self.assertIn(".transform(m[:3])", matrix_4x4)
+        for generated in (matrix_3x4, matrix_4x4):
+            compile(generated, "<generated-multmatrix>", "exec")
+            namespace: dict[str, object] = {}
+            exec(generated, namespace)
+            self.assertEqual(
+                namespace["_parts"][0].bounding_box(),
+                (10.0, 20.0, 30.0, 11.0, 21.0, 31.0),
+            )
+
+    def test_multmatrix_requires_one_matrix_and_child(self) -> None:
+        with self.assertRaisesRegex(TranslationError, "requires one matrix"):
+            self.translate("multmatrix() cube(1);")
+        with self.assertRaisesRegex(TranslationError, "requires a child geometry"):
+            self.translate("multmatrix([[1,0,0,0],[0,1,0,0],[0,0,1,0]]);")
+
+    def test_resize_matches_openscad_auto_and_fixed_sizes(self) -> None:
+        generated = self.translate("""
+            resize([7,0,0]) cube([1,2,0.5]);
+            resize([7,0,0], auto=true) cube([1,2,0.5]);
+            resize(newsize=[10,4,0], auto=[true,true,true]) cube([5,4,1]);
+            resize([10,0,0], auto=[true,true,false]) cube([5,4,1]);
+            resize([6], auto=[false,true]) square([2,4]);
+            resize([4,0,0], auto=true) square([2,4]);
+            resize([0,0,0], auto=true) cube([1,2,3]);
+            resize([10,0,0]) translate([5,0,0]) cube([5,4,1]);
+            """)
+        self.assertIn("def _scadtopy_resize(", generated)
+        compile(generated, "<generated-resize>", "exec")
+        namespace: dict[str, object] = {}
+        exec(generated, namespace)
+        expected = [
+            (0, 0, 0, 7, 2, 0.5),
+            (0, 0, 0, 7, 14, 3.5),
+            (0, 0, 0, 10, 4, 2),
+            (0, 0, 0, 10, 8, 1),
+            (0, 0, 6, 12),
+            (0, 0, 4, 8),
+            (0, 0, 0, 1, 2, 3),
+            (10, 0, 0, 20, 4, 1),
+        ]
+        for part, bounds in zip(namespace["_parts"], expected, strict=True):
+            self.assertEqual(part.bounding_box(), bounds)
+
+    def test_resize_validates_arguments(self) -> None:
+        for source, message in (
+            ("resize() cube(1);", "requires newsize"),
+            ("resize([1,2,3]);", "requires child geometry"),
+            ("resize([1,2,3], bad=true) cube(1);", "Unsupported resize"),
+            ("resize([1,2,3], newsize=[1,2,3]) cube(1);", "multiple values"),
+            ("resize([1,2,3], false, 1, 2) cube(1);", "Too many"),
+        ):
+            with self.subTest(source=source):
+                with self.assertRaisesRegex(TranslationError, message):
+                    self.translate(source)
+
+    def test_resize_uses_union_of_child_geometry(self) -> None:
         generated = self.translate(
-            """
+            "resize([10,0,0]) { cube(1); translate([4,0,0]) cube(1); }"
+        )
+        namespace: dict[str, object] = {}
+        exec(generated, namespace)
+        self.assertEqual(namespace["_parts"][0].bounding_box(), (0, 0, 0, 10, 1, 1))
+        self.assertNotIn("def _scadtopy_resize", self.translate("cube(1);"))
+
+    def test_translates_centered_linear_extrusion_and_csg(self) -> None:
+        generated = self.translate("""
             intersection() {
                 hull() {
                     linear_extrude(height=10, center=true) square(4);
@@ -648,8 +1048,7 @@ class TranslatorTests(unittest.TestCase):
                 }
                 cube(8);
             }
-            """
-        )
+            """)
 
         self.assertIn("intersect(hull(", generated)
         self.assertIn(
@@ -660,7 +1059,7 @@ class TranslatorTests(unittest.TestCase):
 
     def test_marks_unmapped_parser_nodes_for_follow_up(self) -> None:
         generated = self.translate(
-            "for (i = [0:2]) cube(1); *sphere(2); use <library.scad>;"
+            "for (i = [0:2]) cube(1); bevel(2); use <library.scad>;"
         )
 
         self.assertIn("pass  # FIXME", generated)

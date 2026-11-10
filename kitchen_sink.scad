@@ -430,6 +430,40 @@ linear_extrude(height=10, twist=-90, slices=20, scale=0.5)
 square(6, center=true);
 
 //--------------------------------------------------
+// Easy Built-ins
+//--------------------------------------------------
+
+easy_value = round(-2.5) + round(2.5) + sign(-3) + sign(0);
+easy_list = concat([1], [2]);
+easy_mixed = concat(easy_list, 3);
+easy_checks = [is_undef(easy_value), is_list(easy_list), is_string("x"), is_bool(true), is_num(1)];
+easy_random = rands(0, 1, 3, 42);
+easy_lookup = lookup(1.5, [[0, 0], [2, 2]]);
+easy_text = str("a", 1, [1, 2], true);
+
+echo("easy", easy_value, easy_list, easy_mixed, easy_checks, len(easy_random), easy_lookup, easy_text);
+
+//--------------------------------------------------
+// group() and Modifiers
+//--------------------------------------------------
+
+translate([0, 120, 0])
+group()
+{
+    cube(5);
+    sphere(4);
+}
+
+// Disabled: must produce nothing.
+*translate([30, 120, 0]) cube(5);
+
+// Highlight and background are ignored but their geometry is kept.
+#translate([30, 120, 0]) cube(4);
+%translate([60, 120, 0]) sphere(4);
+
+// "!" (show only) is a translation error, so it is not used here.
+
+//--------------------------------------------------
 // End
 //--------------------------------------------------
 

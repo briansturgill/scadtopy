@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import ast
+import re
+import warnings
 from pathlib import Path
 from typing import Iterable
 
@@ -116,6 +118,96 @@ _MATH_FUNCTIONS = {
     "exp": "math.exp",
 }
 
+_BUILTIN_HELPERS = {
+    "sign": ("def _scadtopy_sign(x):\n" "    return (x > 0) - (x < 0)"),
+    "round": (
+        "def _scadtopy_round(x):\n"
+        "    return math.copysign(math.floor(abs(x) + 0.5), x)"
+    ),
+    "concat": (
+        "def _scadtopy_concat(*values):\n"
+        "    result = []\n"
+        "    for value in values:\n"
+        "        if isinstance(value, (list, tuple)):\n"
+        "            result.extend(value)\n"
+        "        else:\n"
+        "            result.append(value)\n"
+        "    return result"
+    ),
+    "str": (
+        "def _scadtopy_str(*values):\n"
+        "    def render(value):\n"
+        "        if value is True:\n"
+        "            return 'true'\n"
+        "        if value is False:\n"
+        "            return 'false'\n"
+        "        if value is None:\n"
+        "            return 'undef'\n"
+        "        if isinstance(value, (list, tuple)):\n"
+        "            return '[' + ', '.join(render(item) for item in value) + ']'\n"
+        "        if isinstance(value, float) and value.is_integer():\n"
+        "            return str(int(value))\n"
+        "        return str(value)\n"
+        "\n"
+        "    return ''.join(value if isinstance(value, str) else render(value) for value in values)"
+    ),
+    "rands": (
+        "def _scadtopy_rands(low, high, count, seed=None):\n"
+        "    generator = random.Random(seed)\n"
+        "    return [generator.uniform(low, high) for _ in range(int(count))]"
+    ),
+    "lookup": (
+        "def _scadtopy_lookup(key, table):\n"
+        "    table = sorted(table)\n"
+        "    if key <= table[0][0]:\n"
+        "        return table[0][1]\n"
+        "    for (x0, y0), (x1, y1) in zip(table, table[1:]):\n"
+        "        if key <= x1:\n"
+        "            return y0 + (y1 - y0) * (key - x0) / (x1 - x0)\n"
+        "    return table[-1][1]"
+    ),
+    "search": (
+        "def _scadtopy_search(match_value, string_or_vector, "
+        "num_returns_per_match=1, index_col_num=0):\n"
+        "    if isinstance(match_value, bool):\n"
+        "        return None\n"
+        "    single_string = isinstance(match_value, str)\n"
+        "    single_value = not single_string and not isinstance(match_value, (list, tuple))\n"
+        "    if single_string:\n"
+        "        queries = list(match_value)\n"
+        "    elif isinstance(match_value, (list, tuple)):\n"
+        "        queries = list(match_value)\n"
+        "    else:\n"
+        "        queries = [match_value]\n"
+        "    values = list(string_or_vector)\n"
+        "    index_col_num = int(index_col_num)\n"
+        "    limit = int(num_returns_per_match)\n"
+        "    results = []\n"
+        "    for query in queries:\n"
+        "        if isinstance(query, bool):\n"
+        "            results.append([])\n"
+        "            continue\n"
+        "        matches = []\n"
+        "        for index, value in enumerate(values):\n"
+        "            if isinstance(value, (list, tuple)):\n"
+        "                if not -len(value) <= index_col_num < len(value):\n"
+        "                    continue\n"
+        "                value = value[index_col_num]\n"
+        "            if query == value:\n"
+        "                matches.append(index)\n"
+        "                if limit > 0 and len(matches) >= limit:\n"
+        "                    break\n"
+        "        results.append(matches)\n"
+        "    if limit == 1:\n"
+        "        if single_string:\n"
+        "            return [matches[0] for matches in results if matches]\n"
+        "        if single_value:\n"
+        "            return [results[0][0]] if results and results[0] else []\n"
+        "        return [matches[0] if matches else [] for matches in results]\n"
+        "    return results"
+    ),
+}
+
 try:
     import piecad as _piecad
 
@@ -144,6 +236,22 @@ def _uses_children(node: object) -> bool:
     return False
 
 
+def _unsupported_special_variables(node: object) -> set[str]:
+    if isinstance(node, Identifier):
+        return {node.name} if node.name in _UNSUPPORTED_SPECIAL_VARIABLES else set()
+    if isinstance(node, (list, tuple)):
+        return set().union(*(_unsupported_special_variables(item) for item in node))
+    if hasattr(node, "__dict__"):
+        return set().union(
+            *(
+                _unsupported_special_variables(value)
+                for key, value in vars(node).items()
+                if key != "position"
+            )
+        )
+    return set()
+
+
 def _all_module_names(nodes: Iterable[object]) -> set[str]:
     names: set[str] = set()
     for node in nodes:
@@ -163,22 +271,10 @@ def _children_modules(nodes: Iterable[object]) -> set[str]:
     return names
 
 
-_TWO_D_CALLS = {"square", "circle", "polygon", "text", "offset", "projection"}
-_THREE_D_CALLS = {
-    "cube", "sphere", "cylinder", "polyhedron", "linear_extrude", "rotate_extrude",
-    "surface", "import",
-}
+_EXPORT_COMMENT = re.compile(r"\s*export\s+(\S+\.\w+)\s*$", re.I)
 
-
-def _is_2d(node: object) -> bool:
-    if isinstance(node, (list, tuple)):
-        return any(_is_2d(item) for item in node)
-    if isinstance(node, ModularCall):
-        if node.name.name in _TWO_D_CALLS:
-            return True
-        if node.name.name in _THREE_D_CALLS:
-            return False
-    return _is_2d(getattr(node, "children", None) or [])
+_PIECAD_LOAD_EXTENSIONS = {"3mf", "glb", "gltf", "obj", "ply", "stl"}
+_UNSUPPORTED_SPECIAL_VARIABLES = {"$t", "$preview", "$vpr", "$vpt", "$vpd"}
 
 
 def _tidy(code: str) -> str:
@@ -187,16 +283,6 @@ def _tidy(code: str) -> str:
         return ast.unparse(ast.parse(code, mode="eval"))
     except SyntaxError:
         return code
-
-
-def _first_two(code: str) -> str:
-    try:
-        tree = ast.parse(code, mode="eval").body
-    except SyntaxError:
-        return f"({code})[:2]"
-    if isinstance(tree, ast.List) and len(tree.elts) >= 2:
-        return ast.unparse(ast.List(elts=tree.elts[:2], ctx=ast.Load()))
-    return f"({code})[:2]"
 
 
 def _receiver(code: str) -> str:
@@ -219,17 +305,23 @@ def _position(node: object) -> str:
 class _Translator:
     def __init__(self) -> None:
         self.output_stem = ""
+        self.source_path: Path | None = None
         self.base_dir: Path | None = None
         self.function_names: set[str] = set()
         self.uses_vec2 = False
+        self.helpers: set[str] = set()
         self.module_names: set[str] = set()
         self.shadowing_names: set[str] = set()
         self.children_modules: set[str] = set()
         self.uses_children_helper = False
         self.uses_linear_extrude_helper = False
         self.uses_text_helper = False
+        self.uses_translate_helper = False
+        self.uses_resize_helper = False
+        self.uses_segments_helper = False
         self.uses_ranges = False
         self.uses_math = False
+        self.segment_overrides: tuple[str, str, str] | None = None
         self.uses_assert_helper = False
         self.uses_echo_helper = False
         self.fixmes: list[str] = []
@@ -247,13 +339,18 @@ class _Translator:
         }
         self.uses_ranges = False
         self.uses_math = False
+        self.segment_overrides = None
         self.uses_assert_helper = False
         self.uses_echo_helper = False
         self.fixmes = []
         self.uses_children_helper = False
         self.uses_linear_extrude_helper = False
         self.uses_text_helper = False
+        self.uses_translate_helper = False
+        self.uses_resize_helper = False
+        self.uses_segments_helper = False
         self.uses_vec2 = False
+        self.helpers = set()
         self.function_names = {
             node.name.name for node in nodes if isinstance(node, FunctionDeclaration)
         }
@@ -262,22 +359,52 @@ class _Translator:
         for node in nodes:
             if isinstance(node, UseStatement):
                 self.load_used_names(node)
-        statements: list[str] = ["_parts = []"]
-        models: list[str] = []
-        parts_2d: list[str] = []
-        parts_3d: list[str] = []
+        statements: list[str] = [
+            "_parts = []",
+            "_scadtopy_default_fn = 0",
+            "_scadtopy_default_fa = Config.get_default_min_angle()",
+            "_scadtopy_default_fs = Config.get_default_min_segment_length()",
+        ]
         saw_model = False
+        part_count = 0
+        exports: list[tuple[int, str]] = []
         last_statement_is_model = False
 
         for node in nodes:
             if isinstance(node, Assignment):
+                unsupported = _unsupported_special_variables(node.expr)
+                if unsupported:
+                    statements.append(
+                        f"# UNSUPPORTED: {', '.join(sorted(unsupported))} "
+                        "are not translated"
+                    )
+                    last_statement_is_model = False
+                    continue
                 value = self.expression(node.expr)
                 if node.name.name == "$fn":
-                    statements.append(f"Config.set_default_segments(int({value}))")
-                elif node.name.name.startswith("$"):
-                    statements.append(
-                        f"# UNSUPPORTED: {node.name.name} = {value}"
+                    statements.extend(
+                        [
+                            f"_scadtopy_default_fn = int({value})",
+                            "if _scadtopy_default_fn > 0:",
+                            "    Config.set_default_segments(_scadtopy_default_fn)",
+                        ]
                     )
+                elif node.name.name == "$fa":
+                    statements.extend(
+                        [
+                            f"_scadtopy_default_fa = {value}",
+                            f"Config.set_default_min_angle({value})",
+                        ]
+                    )
+                elif node.name.name == "$fs":
+                    statements.extend(
+                        [
+                            f"_scadtopy_default_fs = {value}",
+                            f"Config.set_default_min_segment_length({value})",
+                        ]
+                    )
+                elif node.name.name.startswith("$"):
+                    statements.append(f"# UNSUPPORTED: {node.name.name} = {value}")
                 else:
                     statements.append(f"{node.name.name} = {value}")
                 last_statement_is_model = False
@@ -288,6 +415,14 @@ class _Translator:
                 statements.extend(self.function_declaration(node))
                 last_statement_is_model = False
             elif isinstance(node, ModuleInstantiation):
+                unsupported = _unsupported_special_variables(node)
+                if unsupported:
+                    statements.append(
+                        f"# UNSUPPORTED: {', '.join(sorted(unsupported))} "
+                        "are not translated"
+                    )
+                    last_statement_is_model = False
+                    continue
                 if isinstance(node, ModularModifierDisable):
                     self.module_call(node)
                     last_statement_is_model = False
@@ -301,9 +436,8 @@ class _Translator:
                     saw_model = True
                     model = self.module_call(node)
                     if model != "None":
-                        models.append(model)
-                        (parts_2d if _is_2d(node) else parts_3d).append(model)
                         statements.append(f"_parts.append({model})")
+                        part_count += 1
                         last_statement_is_model = True
                     else:
                         last_statement_is_model = False
@@ -313,6 +447,9 @@ class _Translator:
                     and node.same_line
                     and last_statement_is_model
                 ):
+                    exported = _EXPORT_COMMENT.match(node.text)
+                    if exported:
+                        exports.append((part_count - 1, exported.group(1)))
                     suffix = (
                         f"#{node.text}"
                         if node.text.startswith((" ", "\t"))
@@ -334,7 +471,9 @@ class _Translator:
                 )
                 last_statement_is_model = False
             else:
-                statements.append(f"pass  # FIXME: {_node_name(node)} is not translated")
+                statements.append(
+                    f"pass  # FIXME: {_node_name(node)} is not translated"
+                )
                 last_statement_is_model = False
 
         if saw_model:
@@ -342,7 +481,11 @@ class _Translator:
                 [
                     "",
                     'if __name__ == "__main__":',
-                    *self.save_lines(bool(parts_3d), bool(parts_2d)),
+                    *(
+                        f"    save({name!r}, _parts[{index}])"
+                        for index, name in exports
+                    ),
+                    *self.save_lines(),
                     "    for _part in _parts:",
                     "        view(_part)",
                     "    view_all_now()",
@@ -356,6 +499,10 @@ class _Translator:
             prefix = f"import math\n\n{_RANGE_HELPER}\n\n"
         elif self.uses_math:
             prefix = "import math\n\n"
+        if "round" in self.helpers and not prefix:
+            prefix = "import math\n\n"
+        if "rands" in self.helpers:
+            prefix += "import random\n\n"
         if self.uses_assert_helper:
             prefix += (
                 "def _scadtopy_assert(condition, message, value):\n"
@@ -388,10 +535,64 @@ class _Translator:
                 "    print('ECHO: ' + ', '.join(rendered))\n"
                 "    return result()\n\n"
             )
+        for helper in sorted(self.helpers):
+            prefix += _BUILTIN_HELPERS[helper] + "\n\n"
         prefix += "from piecad import *\n"
         if self.uses_vec2:
             prefix += "from piecad.lin_math import Vec2\n"
         prefix += "\n"
+        if self.uses_segments_helper or self.uses_linear_extrude_helper:
+            prefix += (
+                "def _scadtopy_segments(radius, fn, fa, fs):\n"
+                "    if fn > 0:\n"
+                "        return max(fn, 3)\n"
+                "    return Config.calculate_default_segments(radius, fa, fs)\n\n"
+            )
+        if self.uses_translate_helper:
+            prefix += (
+                "def _scadtopy_translate(obj, vector):\n"
+                "    if isinstance(obj, Obj2d):\n"
+                "        vector = vector[:2]\n"
+                "    return obj.translate(vector)\n\n"
+            )
+        if self.uses_resize_helper:
+            prefix += (
+                "def _scadtopy_resize(obj, newsize, auto=False):\n"
+                "    if isinstance(obj, Obj2d):\n"
+                "        dimensions = 2\n"
+                "    elif isinstance(obj, Obj3d):\n"
+                "        dimensions = 3\n"
+                "    else:\n"
+                "        raise TypeError('resize() requires an Obj2d or Obj3d')\n"
+                "    if not isinstance(newsize, (list, tuple)):\n"
+                "        raise TypeError('resize() newsize must be a vector')\n"
+                "    targets = list(newsize[:dimensions])\n"
+                "    targets.extend([0] * (dimensions - len(targets)))\n"
+                "    if isinstance(auto, bool):\n"
+                "        auto_axes = [auto] * dimensions\n"
+                "    elif isinstance(auto, (list, tuple)):\n"
+                "        auto_axes = list(auto[:dimensions])\n"
+                "        auto_axes.extend([False] * (dimensions - len(auto_axes)))\n"
+                "    else:\n"
+                "        raise TypeError('resize() auto must be a boolean or vector')\n"
+                "    bounds = obj.bounding_box()\n"
+                "    sizes = [bounds[i + dimensions] - bounds[i] for i in range(dimensions)]\n"
+                "    explicit = [i for i, target in enumerate(targets) if target > 0]\n"
+                "    for i in explicit:\n"
+                "        if sizes[i] == 0:\n"
+                "            raise ValueError('Cannot resize an axis with zero extent')\n"
+                "    largest = max(explicit, key=lambda i: targets[i]) if explicit else None\n"
+                "    auto_scale = targets[largest] / sizes[largest] if largest is not None else 1\n"
+                "    piecad_sizes = []\n"
+                "    for i, target in enumerate(targets):\n"
+                "        if target > 0:\n"
+                "            piecad_sizes.append(target)\n"
+                "        elif auto_axes[i] and sizes[i] != 0:\n"
+                "            piecad_sizes.append(sizes[i] * auto_scale)\n"
+                "        else:\n"
+                "            piecad_sizes.append(None)\n"
+                "    return obj.resize(piecad_sizes)\n\n"
+            )
         if self.uses_children_helper:
             prefix += (
                 "def _scadtopy_children(children, selector=None):\n"
@@ -426,11 +627,19 @@ class _Translator:
             )
         if self.uses_linear_extrude_helper:
             prefix += (
-                "def _scadtopy_linear_extrude(obj, height, center, twist, slices, scale):\n"
+                "def _scadtopy_linear_extrude(obj, height, center, twist, slices, scale, fn, fa, fs):\n"
                 "    if not isinstance(scale, (list, tuple)):\n"
                 "        scale = (scale, scale)\n"
+                "    bounds = obj.bounding_box()\n"
+                "    if len(bounds) == 4:\n"
+                "        min_x, min_y, max_x, max_y = bounds\n"
+                "    else:\n"
+                "        min_x, min_y, _, max_x, max_y, _ = bounds\n"
+                "    radius = math.hypot(max(abs(min_x), abs(max_x)), "
+                "max(abs(min_y), abs(max_y)))\n"
+                "    segments = _scadtopy_segments(radius, fn, fa, fs)\n"
                 "    divisions = int(slices) if slices else (\n"
-                "        max(1, math.ceil(abs(twist) / 360 * Config.get_default_segments()))\n"
+                "        max(1, math.ceil(abs(twist) / 360 * segments))\n"
                 "        if twist else 1\n"
                 "    )\n"
                 "    # Piecad twists counter-clockwise; OpenSCAD positive twist is clockwise.\n"
@@ -444,6 +653,87 @@ class _Translator:
             )
         return prefix + (body + "\n" if body else "")
 
+    def builtin_call(
+        self, name: str, nodes: list[object], arguments: list[str]
+    ) -> str | None:
+        count = len(arguments)
+        if name == "search":
+            parameters = (
+                "match_value",
+                "string_or_vector",
+                "num_returns_per_match",
+                "index_col_num",
+            )
+            aliases = {parameter: parameter for parameter in parameters}
+            aliases.update({f"_{parameter}_": parameter for parameter in parameters})
+            bound: dict[str, str] = {}
+            positional_index = 0
+            for node in nodes:
+                if isinstance(node, PositionalArgument):
+                    if positional_index >= len(parameters):
+                        raise TranslationError(
+                            "search() accepts at most four arguments"
+                        )
+                    parameter = parameters[positional_index]
+                    positional_index += 1
+                    value = self.expression(node.expr)
+                elif isinstance(node, NamedArgument):
+                    parameter = aliases.get(node.name.name)
+                    if parameter is None:
+                        raise TranslationError(
+                            f"Unsupported search() parameter {node.name.name!r}"
+                        )
+                    value = self.expression(node.expr)
+                else:
+                    self.unsupported(node)
+                if parameter in bound:
+                    raise TranslationError(
+                        f"search() got multiple values for {parameter!r}"
+                    )
+                bound[parameter] = value
+            if "match_value" not in bound or "string_or_vector" not in bound:
+                raise TranslationError(
+                    "search() requires match_value and string_or_vector"
+                )
+            self.helpers.add("search")
+            return (
+                "_scadtopy_search("
+                + ", ".join(
+                    f"{parameter}={value}" for parameter, value in bound.items()
+                )
+                + ")"
+            )
+        if name == "version" and count == 0:
+            return 'tuple(map(int, version().split(".")))'
+        if name == "is_undef" and count == 1:
+            return f"{arguments[0]} is None"
+        if name == "is_list" and count == 1:
+            return f"isinstance({arguments[0]}, (list, tuple))"
+        if name == "is_string" and count == 1:
+            return f"isinstance({arguments[0]}, str)"
+        if name == "is_bool" and count == 1:
+            return f"isinstance({arguments[0]}, bool)"
+        if name == "is_num" and count == 1:
+            return f"isinstance({arguments[0]}, (int, float))"
+        if name == "is_function" and count == 1:
+            return f"callable({arguments[0]})"
+        if name == "concat" and count:
+            if all(
+                isinstance(getattr(node, "expr", None), ListComprehension)
+                for node in nodes
+            ):
+                return " + ".join(arguments)
+            self.helpers.add("concat")
+        elif name == "rands" and count in {3, 4}:
+            self.helpers.add("rands")
+        elif name in {"sign", "round", "str", "lookup"} and (
+            count == 2 if name == "lookup" else count >= 1
+        ):
+            self.helpers.add(name)
+        else:
+            return None
+        return f"_scadtopy_{name}({', '.join(arguments)})"
+
     def cross(self, nodes: list[object], arguments: list[str]) -> str:
         values = [getattr(argument, "expr", None) for argument in nodes]
         if all(
@@ -453,6 +743,18 @@ class _Translator:
             self.uses_vec2 = True
             return f"Vec2.cross({', '.join(arguments)})[2]"
         return f"Vec3.cross({', '.join(arguments)})"
+
+    def warn(self, node: object, message: str) -> None:
+        if self.source_path is None:
+            warnings.warn(message, UserWarning, stacklevel=2)
+            return
+        line = getattr(getattr(node, "position", None), "line", None) or 1
+        warnings.warn_explicit(
+            message,
+            UserWarning,
+            str(self.source_path),
+            line,
+        )
 
     def used_nodes(self, node: UseStatement) -> list[object]:
         if self.base_dir is None:
@@ -479,34 +781,78 @@ class _Translator:
         }
 
     def use_statement(self, node: UseStatement) -> str:
+        self.warn(
+            node,
+            f"use <{node.filepath.val}> emits a Python import only; "
+            "translate the used .scad file separately to a matching .py file",
+        )
         module = Path(node.filepath.val).stem
         if not module.isidentifier():
-            return f"pass  # FIXME: cannot import {node.filepath.val!r} as a Python module"
+            return (
+                f"pass  # FIXME: cannot import {node.filepath.val!r} as a Python module"
+            )
         return f"from {module} import *"
 
-    def save_lines(self, has_3d: bool, has_2d: bool) -> list[str]:
-        if not self.output_stem or not (has_3d or has_2d):
+    def save_lines(self) -> list[str]:
+        if not self.output_stem:
             return []
-        if has_3d:
-            parts = (
-                "[part for part in _parts if isinstance(part, Obj3d)]"
-                if has_2d
-                else "_parts"
-            )
-            return [f'    save("{self.output_stem}.3mf", union(*{parts}))']
-        return [f'    save("{self.output_stem}.svg", union(*_parts))']
+        return [
+            "    _scadtopy_parts_3d = [part for part in _parts "
+            "if isinstance(part, Obj3d)]",
+            "    if _scadtopy_parts_3d:",
+            f'        save("{self.output_stem}.3mf", union(*_scadtopy_parts_3d))',
+            "    else:",
+            "        _scadtopy_parts_2d = [part for part in _parts "
+            "if isinstance(part, Obj2d)]",
+            "        if _scadtopy_parts_2d:",
+            f'            save("{self.output_stem}.svg", union(*_scadtopy_parts_2d))',
+        ]
 
     def module_declaration(self, node: ModuleDeclaration) -> list[str]:
-        params = self.parameters(node.parameters)
+        unsupported = _unsupported_special_variables(node.parameters)
+        if unsupported:
+            return [
+                f"def {self.py_name(node.name.name)}(*args, **kwargs):",
+                f"    # UNSUPPORTED: {', '.join(sorted(unsupported))} "
+                "are not translated",
+                "    return None",
+            ]
+        params = [self.parameters(node.parameters)] if node.parameters else []
+        params.extend(
+            [
+                "_scadtopy_special_fn=0",
+                "_scadtopy_special_fa=None",
+                "_scadtopy_special_fs=None",
+            ]
+        )
         if _uses_children(node.children):
-            params = f"{params}, _children=()" if params else "_children=()"
-        lines = [f"def {self.py_name(node.name.name)}({params}):"]
-        assignments: list[str] = []
+            params.append("_children=()")
+        lines = [f"def {self.py_name(node.name.name)}({', '.join(params)}):"]
+        assignments: list[str] = [
+            "    _scadtopy_default_fn = _scadtopy_special_fn",
+            "    _scadtopy_default_fa = (Config.get_default_min_angle() "
+            "if _scadtopy_special_fa is None else _scadtopy_special_fa)",
+            "    _scadtopy_default_fs = (Config.get_default_min_segment_length() "
+            "if _scadtopy_special_fs is None else _scadtopy_special_fs)",
+        ]
         geometry: list[str] = []
         for child in node.children:
             if isinstance(child, Assignment):
+                unsupported = _unsupported_special_variables(child.expr)
+                if unsupported:
+                    assignments.append(
+                        f"    # UNSUPPORTED: {', '.join(sorted(unsupported))} "
+                        "are not translated"
+                    )
+                    continue
                 value = self.expression(child.expr)
-                if child.name.name.startswith("$"):
+                if child.name.name == "$fn":
+                    assignments.append(f"    _scadtopy_default_fn = int({value})")
+                elif child.name.name == "$fa":
+                    assignments.append(f"    _scadtopy_default_fa = {value}")
+                elif child.name.name == "$fs":
+                    assignments.append(f"    _scadtopy_default_fs = {value}")
+                elif child.name.name.startswith("$"):
                     assignments.append(
                         f"    # UNSUPPORTED: {child.name.name} = {value}"
                     )
@@ -515,6 +861,13 @@ class _Translator:
             elif isinstance(child, ModularEcho) and not child.children:
                 assignments.append(f"    {self.module_call(child)}")
             elif isinstance(child, ModuleInstantiation):
+                unsupported = _unsupported_special_variables(child)
+                if unsupported:
+                    assignments.append(
+                        f"    # UNSUPPORTED: {', '.join(sorted(unsupported))} "
+                        "are not translated"
+                    )
+                    continue
                 translated = self.module_call(child)
                 if translated != "None":
                     geometry.append(translated)
@@ -527,20 +880,35 @@ class _Translator:
             elif isinstance(child, BlankLine):
                 assignments.append("")
             else:
-                assignments.append(f"    pass  # FIXME: {_node_name(child)} is not translated")
+                assignments.append(
+                    f"    pass  # FIXME: {_node_name(child)} is not translated"
+                )
 
         if assignments:
             lines.extend(assignments)
         if geometry:
-            result = geometry[0] if len(geometry) == 1 else f"union({', '.join(geometry)})"
+            result = (
+                geometry[0] if len(geometry) == 1 else f"union({', '.join(geometry)})"
+            )
             lines.append(f"    return {result}")
         else:
             lines.append("    return None")
         return lines
 
     def function_declaration(self, node: FunctionDeclaration) -> list[str]:
+        unsupported = _unsupported_special_variables([node.parameters, node.expr])
+        if unsupported:
+            return [
+                f"def {self.py_name(node.name.name)}(*args, **kwargs):",
+                f"    # UNSUPPORTED: {', '.join(sorted(unsupported))} "
+                "are not translated",
+                "    return None",
+            ]
         params = self.parameters(node.parameters)
-        return [f"def {self.py_name(node.name.name)}({params}):", f"    return {self.expression(node.expr)}"]
+        return [
+            f"def {self.py_name(node.name.name)}({params}):",
+            f"    return {self.expression(node.expr)}",
+        ]
 
     def parameters(self, parameters: list[object]) -> str:
         return ", ".join(
@@ -570,14 +938,15 @@ class _Translator:
 
         text_lines = node.text.splitlines() or [""]
         lines.extend(
-            f"{indent}# {text}" if text else f"{indent}#"
-            for text in text_lines
+            f"{indent}# {text}" if text else f"{indent}#" for text in text_lines
         )
 
     def assert_values(self, arguments: list[object], node: object) -> tuple[str, str]:
         condition = self.argument_expression(arguments, ("condition",), 0)
         message = self.argument_expression(arguments, ("message",), 1)
-        condition_value = self.expression(condition) if condition is not None else "False"
+        condition_value = (
+            self.expression(condition) if condition is not None else "False"
+        )
         message_value = (
             self.expression(message)
             if message is not None
@@ -649,7 +1018,9 @@ class _Translator:
                 f"{self.module_group(node.false_branch)})"
             )
         if isinstance(node, ModularEcho):
-            return self.echo_expression(node.arguments, self.module_group(node.children))
+            return self.echo_expression(
+                node.arguments, self.module_group(node.children)
+            )
         if isinstance(node, ModularAssert):
             self.uses_assert_helper = True
             condition, message = self.assert_values(node.arguments, node)
@@ -657,18 +1028,14 @@ class _Translator:
                 f"_scadtopy_assert({condition}, {message}, "
                 f"lambda: {self.module_group(node.children)})"
             )
-        if isinstance(
-            node,
-            (
-                ModularModifierShowOnly,
-                ModularModifierHighlight,
-                ModularModifierBackground,
-            ),
-        ):
-            self.note_fixme(node, "display modifier is not represented by Piecad")
+        if isinstance(node, ModularModifierShowOnly):
+            line = getattr(getattr(node, "position", None), "line", None)
+            raise TranslationError(
+                f"Show only ('!') is not allowed at line: {line if line is not None else '?'}"
+            )
+        if isinstance(node, (ModularModifierHighlight, ModularModifierBackground)):
             return self.module_call(node.child)
         if isinstance(node, ModularModifierDisable):
-            self.note_fixme(node, "disabled geometry is not translated")
             return "None"
         if not isinstance(node, ModularCall):
             self.note_fixme(node, f"{_node_name(node)} is not translated")
@@ -676,31 +1043,99 @@ class _Translator:
 
         name = node.name.name
         arguments = self.call_arguments(node.arguments)
+        previous_segment_overrides = self.segment_overrides
+        if name in {"linear_extrude", "offset", "rotate_extrude"}:
+            self.segment_overrides = self.segment_settings(node.arguments)
         source_children = [
             child
             for child in self.module_list(node.children)
             if not isinstance(child, (CommentLine, CommentSpan, BlankLine))
         ]
-        children = [self.module_call(child) for child in source_children]
+        try:
+            children = [self.module_call(child) for child in source_children]
+        finally:
+            self.segment_overrides = previous_segment_overrides
         if source_children and all(child == "None" for child in children):
             return "None"
         children = [child for child in children if child != "None"]
 
         if name in _TRANSFORMS:
             if not children:
-                raise TranslationError(f"{name}() requires a child geometry{_position(node)}")
+                raise TranslationError(
+                    f"{name}() requires a child geometry{_position(node)}"
+                )
             base = self.combine(children)
             return self.transform_call(name, node, base)
 
+        if name == "resize":
+            self.reject_unexpected_named_arguments(
+                node, {"newsize", "auto", "convexity"}
+            )
+            if len(node.arguments) > 3:
+                raise TranslationError(f"Too many resize() arguments{_position(node)}")
+            positional = sum(
+                isinstance(argument, PositionalArgument) for argument in node.arguments
+            )
+            for position, parameter in enumerate(("newsize", "auto", "convexity")):
+                named = sum(
+                    isinstance(argument, NamedArgument)
+                    and argument.name.name == parameter
+                    for argument in node.arguments
+                )
+                if named > 1 or (named and positional > position):
+                    raise TranslationError(
+                        f"resize() got multiple values for {parameter!r}{_position(node)}"
+                    )
+            size = self.argument_value(node.arguments, ("newsize",), 0)
+            auto = self.argument_value(node.arguments, ("auto",), 1)
+            if size is None:
+                raise TranslationError(f"resize() requires newsize{_position(node)}")
+            if not children:
+                raise TranslationError(
+                    f"resize() requires child geometry{_position(node)}"
+                )
+            self.uses_resize_helper = True
+            return (
+                f"_scadtopy_resize({self.combine(children)}, {size}, {auto or 'False'})"
+            )
+
+        if name == "multmatrix":
+            self.reject_unexpected_named_arguments(node, {"m"})
+            matrix = self.argument_expression(node.arguments, ("m",), 0)
+            if matrix is None or len(node.arguments) != 1:
+                raise TranslationError(
+                    f"multmatrix() requires one matrix{_position(node)}"
+                )
+            if not children:
+                raise TranslationError(
+                    f"multmatrix() requires a child geometry{_position(node)}"
+                )
+            return f"{_receiver(self.combine(children))}.transform(({self.expression(matrix)})[:3])"
+
         if name == "linear_extrude":
             if not children:
-                raise TranslationError(f"linear_extrude() requires a child geometry{_position(node)}")
+                raise TranslationError(
+                    f"linear_extrude() requires a child geometry{_position(node)}"
+                )
             self.reject_unexpected_named_arguments(
-                node, {"height", "center", "twist", "slices", "scale", "convexity", "$fn", "$fa", "$fs"}
+                node,
+                {
+                    "height",
+                    "center",
+                    "twist",
+                    "slices",
+                    "scale",
+                    "convexity",
+                    "$fn",
+                    "$fa",
+                    "$fs",
+                },
             )
             height = self.argument_value(node.arguments, ("height",), 0)
             if height is None:
-                raise TranslationError(f"linear_extrude() requires height{_position(node)}")
+                raise TranslationError(
+                    f"linear_extrude() requires height{_position(node)}"
+                )
             center = self.argument_value(node.arguments, ("center",), 1)
             twist = self.argument_value(node.arguments, ("twist",), -1)
             slices = self.argument_value(node.arguments, ("slices",), -1)
@@ -710,13 +1145,17 @@ class _Translator:
                 if center == "True":
                     extruded += f".translate([0, 0, -({height}) / 2])"
                 elif center is not None and center != "False":
-                    extruded += f".translate([0, 0, (-({height}) / 2 if {center} else 0)])"
+                    extruded += (
+                        f".translate([0, 0, (-({height}) / 2 if {center} else 0)])"
+                    )
                 return _tidy(extruded)
             self.uses_linear_extrude_helper = True
             self.uses_math = True
+            fn, fa, fs = self.segment_settings(node.arguments)
             return (
                 f"_scadtopy_linear_extrude({self.combine(children)}, {height}, "
-                f"{center or 'False'}, {twist or '0'}, {slices or 'None'}, {scale or '1'})"
+                f"{center or 'False'}, {twist or '0'}, {slices or 'None'}, "
+                f"{scale or '1'}, {fn}, {fa}, {fs})"
             )
 
         if name == "rotate_extrude":
@@ -726,24 +1165,36 @@ class _Translator:
             if not children:
                 return "None"
             angle = self.argument_value(node.arguments, ("angle",), 0)
-            segments = self.argument_value(node.arguments, ("$fn",), -1)
-            extra = f", int({segments})" if segments is not None else ""
-            if extra and angle is None:
-                angle = "360.0"
-            if angle is None:
-                return f"revolve({self.combine(children)})"
-            return f"revolve({self.combine(children)}, {angle}{extra})"
+            profile = self.combine(children)
+            angle = angle or "360.0"
+            radius = (
+                "max(abs(_scadtopy_profile.bounding_box()[0]), "
+                "abs(_scadtopy_profile.bounding_box()[2]))"
+            )
+            segments = self.segment_count(node, radius)
+            return (
+                f"(lambda _scadtopy_profile: revolve(_scadtopy_profile, {angle}, "
+                f"segments={segments}))({profile})"
+            )
 
         if name in _PIECAD_NAMES:
             if not children:
-                raise TranslationError(f"{name}() requires child geometry{_position(node)}")
+                raise TranslationError(
+                    f"{name}() requires child geometry{_position(node)}"
+                )
             if node.arguments:
-                raise TranslationError(f"{name}() does not accept arguments{_position(node)}")
+                raise TranslationError(
+                    f"{name}() does not accept arguments{_position(node)}"
+                )
+            if name == "union" and len(children) == 1:
+                return children[0]
             return f"{_PIECAD_NAMES[name]}({', '.join(children)})"
 
         if name == "minkowski":
             if node.arguments:
-                raise TranslationError(f"minkowski() does not accept arguments{_position(node)}")
+                raise TranslationError(
+                    f"minkowski() does not accept arguments{_position(node)}"
+                )
             if len(children) < 2:
                 raise TranslationError(
                     f"minkowski() requires at least two child geometries{_position(node)}"
@@ -762,15 +1213,13 @@ class _Translator:
             radius = self.argument_value(node.arguments, ("r",), 0)
             delta = self.argument_value(node.arguments, ("delta",), -1)
             chamfer = self.argument_value(node.arguments, ("chamfer",), -1)
-            segments = self.argument_value(node.arguments, ("$fn",), -1)
             geometry = self.combine(children)
             if delta is not None:
                 join = f'"square" if {chamfer} else "miter"' if chamfer else '"miter"'
                 call = f"{_receiver(geometry)}.offset({delta}, {join}, 1000.0"
             else:
                 call = f'{_receiver(geometry)}.offset({radius or "1"}, "round"'
-            if segments is not None and delta is None:
-                call += f", segments=int({segments})"
+                call += f", segments={self.segment_count(node, radius or '1.0')}"
             return call + ")"
 
         if name == "projection":
@@ -793,7 +1242,7 @@ class _Translator:
                 f"if {cut} else {_receiver(children[0])}.project())"
             )
 
-        if name == "render":
+        if name in {"render", "group"}:
             return self.combine(children) if children else "None"
         if name == "color":
             self.reject_unexpected_named_arguments(node, {"c", "alpha"})
@@ -837,6 +1286,26 @@ class _Translator:
                 node, "text() supports only text, size, halign and valign in Piecad"
             )
             return "None"
+        if name == "import":
+            self.reject_children(node, children)
+            file_node = self.argument_expression(node.arguments, ("file",), 0)
+            if not isinstance(file_node, StringLiteral):
+                self.note_fixme(node, "import() requires a literal file name")
+                return "None"
+            extension = file_node.val.rpartition(".")[2].lower()
+            if extension not in _PIECAD_LOAD_EXTENSIONS:
+                self.note_fixme(
+                    node,
+                    f"import() of .{extension} files is not supported by Piecad load()",
+                )
+                return "None"
+            self.warn(
+                node,
+                f'import("{file_node.val}") is passed to Piecad unchanged and '
+                "resolves relative to the Python process working directory, "
+                "not the .scad file directory",
+            )
+            return f"load({self.expression(file_node)})"
         if name == "polyhedron":
             self.reject_children(node, children)
             points = self.argument_value(node.arguments, ("points",), 0)
@@ -859,7 +1328,11 @@ class _Translator:
             return self.primitive_call(
                 "sphere",
                 node,
-                {"r": "radius", "d": "diameter", "$fn": "segments"},
+                {
+                    "r": "radius",
+                    "d": "diameter",
+                    "$fn": "segments",
+                },
             )
         if name == "cylinder":
             self.reject_children(node, children)
@@ -872,7 +1345,11 @@ class _Translator:
             return self.primitive_call(
                 "circle",
                 node,
-                {"r": "radius", "d": "diameter", "$fn": "segments"},
+                {
+                    "r": "radius",
+                    "d": "diameter",
+                    "$fn": "segments",
+                },
             )
         if name == "polygon":
             self.reject_children(node, children)
@@ -881,7 +1358,9 @@ class _Translator:
             self.reject_unexpected_named_arguments(node, {"points", "paths"})
             if paths is not None:
                 if points is None:
-                    raise TranslationError(f"polygon() requires points{_position(node)}")
+                    raise TranslationError(
+                        f"polygon() requires points{_position(node)}"
+                    )
                 return (
                     f"polygon([[{points}[int(index)] for index in reversed(path)] "
                     f"for path in {paths}])"
@@ -899,11 +1378,14 @@ class _Translator:
                 return "_scadtopy_children(_children)"
             return f"_scadtopy_children(_children, {self.expression(index)})"
         if name in self.module_names:
+            arguments = self.module_call_arguments(node.arguments)
             if children and name in self.children_modules:
                 arguments.append(f"_children=[{', '.join(children)}]")
             return f"{self.py_name(name)}({', '.join(arguments)})"
         if children:
-            self.note_fixme(node, f"child geometry for module {name!r} is not translated")
+            self.note_fixme(
+                node, f"child geometry for module {name!r} is not translated"
+            )
             return "None"
         self.note_fixme(node, f"OpenSCAD module {name!r} has no Piecad mapping")
         return "None"
@@ -914,17 +1396,20 @@ class _Translator:
             self.reject_unexpected_named_arguments(node, {"v"})
             vector = self.argument_expression(node.arguments, ("v",), 0)
             if vector is None or len(node.arguments) != 1:
-                raise TranslationError(f"translate() requires one vector{_position(node)}")
+                raise TranslationError(
+                    f"translate() requires one vector{_position(node)}"
+                )
             rendered = self.expression(vector)
-            if _is_2d(node.children):
-                rendered = _first_two(rendered)
-            return f"{_receiver(geometry)}.translate({rendered})"
+            self.uses_translate_helper = True
+            return f"_scadtopy_translate({_receiver(geometry)}, {rendered})"
 
         if name == "scale":
             self.reject_unexpected_named_arguments(node, {"v"})
             factors = self.argument_expression(node.arguments, ("v",), 0)
             if factors is None or len(node.arguments) != 1:
-                raise TranslationError(f"scale() requires one factor or vector{_position(node)}")
+                raise TranslationError(
+                    f"scale() requires one factor or vector{_position(node)}"
+                )
             rendered = self.expression(factors)
             if not isinstance(factors, ListComprehension):
                 rendered = f"[{rendered}, {rendered}, {rendered}]"
@@ -950,7 +1435,9 @@ class _Translator:
                 axis_values = self.literal_axis(axis, name)
                 if axis_values is None:
                     return "None"
-                axis_index = next(index for index, value in enumerate(axis_values) if value != 0)
+                axis_index = next(
+                    index for index, value in enumerate(axis_values) if value != 0
+                )
                 rendered_angle = self.expression(angle)
                 angles_list = ["0", "0", "0"]
                 sign = "-" if axis_values[axis_index] < 0 else ""
@@ -962,7 +1449,9 @@ class _Translator:
             self.reject_unexpected_named_arguments(node, {"v"})
             axis = self.argument_expression(node.arguments, ("v",), 0)
             if axis is None or len(node.arguments) != 1:
-                raise TranslationError(f"mirror() requires one axis vector{_position(node)}")
+                raise TranslationError(
+                    f"mirror() requires one axis vector{_position(node)}"
+                )
             axis_values = self.literal_axis(axis, name)
             if axis_values is None:
                 return "None"
@@ -972,7 +1461,10 @@ class _Translator:
         raise AssertionError(f"Missing transform mapping for {name}")
 
     def literal_axis(self, expression: object, operation: str) -> list[float] | None:
-        if not isinstance(expression, ListComprehension) or len(expression.elements) != 3:
+        if (
+            not isinstance(expression, ListComprehension)
+            or len(expression.elements) != 3
+        ):
             self.note_fixme(expression, f"{operation}() requires a literal 3-vector")
             return None
         values: list[float] = []
@@ -1034,14 +1526,28 @@ class _Translator:
         d1 = self.argument_value(node.arguments, ("d1",), -1)
         d2 = self.argument_value(node.arguments, ("d2",), -1)
         center = self.argument_value(node.arguments, ("center",), 2)
-        segments = self.argument_value(node.arguments, ("$fn",), -1)
         if height is None:
             raise TranslationError(f"cylinder() requires height{_position(node)}")
         unsupported_arguments = {
             argument.name.name
             for argument in node.arguments
             if isinstance(argument, NamedArgument)
-        } - {"h", "height", "r", "r1", "r2", "radius", "d", "d1", "d2", "diameter", "center", "$fn"}
+        } - {
+            "h",
+            "height",
+            "r",
+            "r1",
+            "r2",
+            "radius",
+            "d",
+            "d1",
+            "d2",
+            "diameter",
+            "center",
+            "$fn",
+            "$fa",
+            "$fs",
+        }
         if unsupported_arguments:
             raise TranslationError(
                 f"Unsupported cylinder parameter(s): {', '.join(sorted(unsupported_arguments))}"
@@ -1065,7 +1571,11 @@ class _Translator:
             r1 = f"({d1}) / 2"
         if d2 is not None:
             r2 = f"({d2}) / 2"
-        keywords = [f"segments={segments}"] if segments is not None else []
+        if r1 is not None:
+            segment_radius = f"max(abs({r1}), abs({r2}))"
+        else:
+            segment_radius = radius or "1.0"
+        keywords = [f"segments={self.segment_count(node, segment_radius)}"]
         if center is not None:
             keywords.append(f"center={center}")
         if r1 is not None:
@@ -1092,14 +1602,22 @@ class _Translator:
         aliases: dict[str, str],
     ) -> str:
         values: list[str] = []
-        allowed = set(aliases) | set(aliases.values())
+        allowed = set(aliases) | set(aliases.values()) | {"$fa", "$fs"}
         self.reject_unexpected_named_arguments(node, allowed)
-        if len(node.arguments) > 2:
+        positional_count = sum(
+            isinstance(argument, PositionalArgument) for argument in node.arguments
+        )
+        if positional_count > 2:
             raise TranslationError(f"Too many {target}() arguments{_position(node)}")
+        positional_index = 0
         for argument in node.arguments:
             if isinstance(argument, PositionalArgument):
-                values.append(self.expression(argument.expr))
+                if positional_index == 0:
+                    values.append(self.expression(argument.expr))
+                positional_index += 1
             elif isinstance(argument, NamedArgument):
+                if argument.name.name in {"$fn", "$fa", "$fs", "segments"}:
+                    continue
                 name = aliases.get(argument.name.name, argument.name.name)
                 if name.startswith("$"):
                     raise TranslationError(
@@ -1109,7 +1627,87 @@ class _Translator:
                     values.append(f"radius=({self.expression(argument.expr)}) / 2")
                 else:
                     values.append(f"{name}={self.expression(argument.expr)}")
+        radius = self.argument_value(node.arguments, ("r", "radius"), 0)
+        diameter = self.argument_value(node.arguments, ("d", "diameter"), -1)
+        if diameter is not None:
+            radius = f"({diameter}) / 2"
+        if radius is not None:
+            values.append(
+                f"segments={self.segment_count(node, radius, positional_fn_index=1)}"
+            )
         return f"{target}({', '.join(values)})"
+
+    def segment_count(
+        self,
+        node: ModularCall,
+        radius: str,
+        positional_fn_index: int = -1,
+    ) -> str:
+        fn, fa, fs = self.segment_settings(node.arguments, positional_fn_index)
+        self.uses_segments_helper = True
+        return f"_scadtopy_segments({radius}, {fn}, {fa}, {fs})"
+
+    def segment_settings(
+        self,
+        arguments: list[object],
+        positional_fn_index: int = -1,
+    ) -> tuple[str, str, str]:
+        fn, fa, fs = self.segment_overrides or (
+            "_scadtopy_default_fn",
+            "_scadtopy_default_fa",
+            "_scadtopy_default_fs",
+        )
+        fn_override = self.argument_value(arguments, ("$fn",), positional_fn_index)
+        fa_override = self.argument_value(arguments, ("$fa",), -1)
+        fs_override = self.argument_value(arguments, ("$fs",), -1)
+        return (
+            f"int({fn_override})" if fn_override is not None else fn,
+            fa_override if fa_override is not None else fa,
+            fs_override if fs_override is not None else fs,
+        )
+
+    def module_call_arguments(self, arguments: list[object]) -> list[str]:
+        special_names = {
+            "$fn": "_scadtopy_special_fn",
+            "$fa": "_scadtopy_special_fa",
+            "$fs": "_scadtopy_special_fs",
+        }
+        rendered: list[str] = []
+        provided: set[str] = set()
+        for argument in arguments:
+            if isinstance(argument, PositionalArgument):
+                rendered.append(self.expression(argument.expr))
+            elif isinstance(argument, NamedArgument):
+                name = argument.name.name
+                if name in special_names:
+                    rendered.append(
+                        f"{special_names[name]}="
+                        f"{'int(' if name == '$fn' else ''}"
+                        f"{self.expression(argument.expr)}"
+                        f"{')' if name == '$fn' else ''}"
+                    )
+                    provided.add(name)
+                else:
+                    rendered.append(f"{name}={self.expression(argument.expr)}")
+            else:
+                self.unsupported(argument)
+
+        current_fn, current_fa, current_fs = self.segment_overrides or (
+            "_scadtopy_default_fn",
+            "_scadtopy_default_fa",
+            "_scadtopy_default_fs",
+        )
+        inherited = {
+            "$fn": current_fn,
+            "$fa": current_fa,
+            "$fs": current_fs,
+        }
+        rendered.extend(
+            f"{special_names[name]}={value}"
+            for name, value in inherited.items()
+            if name not in provided
+        )
+        return rendered
 
     def call_arguments(self, arguments: list[object]) -> list[str]:
         rendered: list[str] = []
@@ -1165,13 +1763,14 @@ class _Translator:
             for argument in arguments
             if isinstance(argument, PositionalArgument)
         ]
-        return (
-            positional_index < len(positional)
-            and isinstance(positional[positional_index].expr, ListComprehension)
+        return positional_index < len(positional) and isinstance(
+            positional[positional_index].expr, ListComprehension
         )
 
     def combine(self, geometries: list[str]) -> str:
-        return geometries[0] if len(geometries) == 1 else f"union({', '.join(geometries)})"
+        return (
+            geometries[0] if len(geometries) == 1 else f"union({', '.join(geometries)})"
+        )
 
     def note_fixme(self, node: object, message: str) -> None:
         line = _position(node).removeprefix(" at line ")
@@ -1210,7 +1809,9 @@ class _Translator:
             )
             for element in node.elements
         ):
-            return f"[{', '.join(self.expression(element) for element in node.elements)}]"
+            return (
+                f"[{', '.join(self.expression(element) for element in node.elements)}]"
+            )
         return f"sum([{', '.join(elements)}], [])"
 
     def vector_segment(self, element: object, clauses: list[str] | None = None) -> str:
@@ -1239,7 +1840,9 @@ class _Translator:
         if isinstance(element, ListCompEach):
             value = self.vector_element_value(element.body)
             if clauses:
-                self.note_fixme(element, "each inside a list comprehension is approximated")
+                self.note_fixme(
+                    element, "each inside a list comprehension is approximated"
+                )
                 return f"[{value} {' '.join(clauses)}]"
             return value
         if isinstance(element, ListCompCFor):
@@ -1251,7 +1854,9 @@ class _Translator:
     def vector_element_value(self, element: object) -> str:
         if isinstance(element, (ListCompFor, ListCompIf, ListCompIfElse, ListCompLet)):
             segment = self.vector_segment(element)
-            self.note_fixme(element, "nested list-comprehension control is approximated")
+            self.note_fixme(
+                element, "nested list-comprehension control is approximated"
+            )
             return segment
         if isinstance(element, ListCompEach):
             return self.vector_element_value(element.body)
@@ -1266,6 +1871,12 @@ class _Translator:
         if isinstance(node, Identifier):
             if node.name == "$children":
                 return "len(_children)"
+            if node.name == "$fn":
+                return "_scadtopy_default_fn"
+            if node.name == "$fa":
+                return "_scadtopy_default_fa"
+            if node.name == "$fs":
+                return "_scadtopy_default_fs"
             if node.name == "PI":
                 self.uses_math = True
                 return "math.pi"
@@ -1303,14 +1914,18 @@ class _Translator:
             return self.list_comprehension(node)
         if isinstance(node, PrimaryCall):
             if not isinstance(node.left, Identifier):
-                self.note_fixme(node, "calls through a non-identifier expression are not translated")
-                return "None"
+                callable_expr = _receiver(self.expression(node.left))
+                arguments = self.call_arguments(node.arguments)
+                return f"{callable_expr}({', '.join(arguments)})"
             name = node.left.name
             arguments = self.call_arguments(node.arguments)
             if name not in self.function_names:
                 if name in _MATH_FUNCTIONS:
                     self.uses_math = True
                     return f"{_MATH_FUNCTIONS[name]}({', '.join(arguments)})"
+                builtin = self.builtin_call(name, node.arguments, arguments)
+                if builtin is not None:
+                    return builtin
                 if name == "norm" and len(arguments) == 1:
                     self.uses_math = True
                     return f"math.hypot(*{arguments[0]})"
@@ -1318,14 +1933,15 @@ class _Translator:
                     return self.cross(node.arguments, arguments)
             return f"{self.py_name(name)}({', '.join(arguments)})"
         if isinstance(node, PrimaryIndex):
-            if isinstance(node.index, NumberLiteral) and float(node.index.val).is_integer():
-                return f"{self.expression(node.left)}[{int(node.index.val)}]"
-            return (
-                f"{self.expression(node.left)}"
-                f"[int({self.expression(node.index)})]"
-            )
+            receiver = _receiver(self.expression(node.left))
+            if (
+                isinstance(node.index, NumberLiteral)
+                and float(node.index.val).is_integer()
+            ):
+                return f"{receiver}[{int(node.index.val)}]"
+            return f"{receiver}[int({self.expression(node.index)})]"
         if isinstance(node, PrimaryMember):
-            return f"{self.expression(node.left)}.{node.member.name}"
+            return f"{_receiver(self.expression(node.left))}.{node.member.name}"
 
         name = _node_name(node)
         if name in _BINARY_OPERATORS:
@@ -1364,5 +1980,6 @@ def translate_file(source: str | Path) -> str:
         raise TranslationError(f"Could not parse OpenSCAD file: {path}")
     translator = _Translator()
     translator.output_stem = path.stem
+    translator.source_path = path
     translator.base_dir = path.resolve().parent
     return translator.translate(nodes)
