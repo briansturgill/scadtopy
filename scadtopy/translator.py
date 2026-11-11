@@ -322,6 +322,7 @@ class _Translator:
         self.uses_ranges = False
         self.uses_math = False
         self.segment_overrides: tuple[str, str, str] | None = None
+        self.in_module = False
         self.uses_assert_helper = False
         self.uses_echo_helper = False
         self.fixmes: list[str] = []
@@ -340,6 +341,7 @@ class _Translator:
         self.uses_ranges = False
         self.uses_math = False
         self.segment_overrides = None
+        self.in_module = False
         self.uses_assert_helper = False
         self.uses_echo_helper = False
         self.fixmes = []
@@ -361,7 +363,7 @@ class _Translator:
                 self.load_used_names(node)
         statements: list[str] = [
             "_parts = []",
-            "_scadtopy_default_fn = 0",
+            "_scadtopy_default_fn = Config.get_default_segments()",
             "_scadtopy_default_fa = Config.get_default_min_angle()",
             "_scadtopy_default_fs = Config.get_default_min_segment_length()",
         ]
@@ -382,27 +384,11 @@ class _Translator:
                     continue
                 value = self.expression(node.expr)
                 if node.name.name == "$fn":
-                    statements.extend(
-                        [
-                            f"_scadtopy_default_fn = int({value})",
-                            "if _scadtopy_default_fn > 0:",
-                            "    Config.set_default_segments(_scadtopy_default_fn)",
-                        ]
-                    )
+                    statements.append(f"_scadtopy_default_fn = int({value})")
                 elif node.name.name == "$fa":
-                    statements.extend(
-                        [
-                            f"_scadtopy_default_fa = {value}",
-                            f"Config.set_default_min_angle({value})",
-                        ]
-                    )
+                    statements.append(f"_scadtopy_default_fa = {value}")
                 elif node.name.name == "$fs":
-                    statements.extend(
-                        [
-                            f"_scadtopy_default_fs = {value}",
-                            f"Config.set_default_min_segment_length({value})",
-                        ]
-                    )
+                    statements.append(f"_scadtopy_default_fs = {value}")
                 elif node.name.name.startswith("$"):
                     statements.append(f"# UNSUPPORTED: {node.name.name} = {value}")
                 else:
@@ -543,7 +529,7 @@ class _Translator:
         prefix += "\n"
         if self.uses_segments_helper or self.uses_linear_extrude_helper:
             prefix += (
-                "def _scadtopy_segments(radius, fn, fa, fs):\n"
+                "def _scadtopy_calculate_segments(radius, fn, fa, fs):\n"
                 "    if fn > 0:\n"
                 "        return max(fn, 3)\n"
                 "    return Config.calculate_default_segments(radius, fa, fs)\n\n"
@@ -637,7 +623,7 @@ class _Translator:
                 "        min_x, min_y, _, max_x, max_y, _ = bounds\n"
                 "    radius = math.hypot(max(abs(min_x), abs(max_x)), "
                 "max(abs(min_y), abs(max_y)))\n"
-                "    segments = _scadtopy_segments(radius, fn, fa, fs)\n"
+                "    segments = _scadtopy_calculate_segments(radius, fn, fa, fs)\n"
                 "    divisions = int(slices) if slices else (\n"
                 "        max(1, math.ceil(abs(twist) / 360 * segments))\n"
                 "        if twist else 1\n"
@@ -820,7 +806,7 @@ class _Translator:
         params = [self.parameters(node.parameters)] if node.parameters else []
         params.extend(
             [
-                "_scadtopy_special_fn=0",
+                "_scadtopy_special_fn=None",
                 "_scadtopy_special_fa=None",
                 "_scadtopy_special_fs=None",
             ]
@@ -829,12 +815,15 @@ class _Translator:
             params.append("_children=()")
         lines = [f"def {self.py_name(node.name.name)}({', '.join(params)}):"]
         assignments: list[str] = [
-            "    _scadtopy_default_fn = _scadtopy_special_fn",
-            "    _scadtopy_default_fa = (Config.get_default_min_angle() "
-            "if _scadtopy_special_fa is None else _scadtopy_special_fa)",
-            "    _scadtopy_default_fs = (Config.get_default_min_segment_length() "
-            "if _scadtopy_special_fs is None else _scadtopy_special_fs)",
+            "    if _scadtopy_special_fn is None:",
+            "        _scadtopy_special_fn = _scadtopy_default_fn",
+            "    if _scadtopy_special_fa is None:",
+            "        _scadtopy_special_fa = _scadtopy_default_fa",
+            "    if _scadtopy_special_fs is None:",
+            "        _scadtopy_special_fs = _scadtopy_default_fs",
         ]
+        previous_in_module = self.in_module
+        self.in_module = True
         geometry: list[str] = []
         for child in node.children:
             if isinstance(child, Assignment):
@@ -847,11 +836,11 @@ class _Translator:
                     continue
                 value = self.expression(child.expr)
                 if child.name.name == "$fn":
-                    assignments.append(f"    _scadtopy_default_fn = int({value})")
+                    assignments.append(f"    _scadtopy_special_fn = int({value})")
                 elif child.name.name == "$fa":
-                    assignments.append(f"    _scadtopy_default_fa = {value}")
+                    assignments.append(f"    _scadtopy_special_fa = {value}")
                 elif child.name.name == "$fs":
-                    assignments.append(f"    _scadtopy_default_fs = {value}")
+                    assignments.append(f"    _scadtopy_special_fs = {value}")
                 elif child.name.name.startswith("$"):
                     assignments.append(
                         f"    # UNSUPPORTED: {child.name.name} = {value}"
@@ -884,6 +873,7 @@ class _Translator:
                     f"    pass  # FIXME: {_node_name(child)} is not translated"
                 )
 
+        self.in_module = previous_in_module
         if assignments:
             lines.extend(assignments)
         if geometry:
@@ -1645,18 +1635,29 @@ class _Translator:
     ) -> str:
         fn, fa, fs = self.segment_settings(node.arguments, positional_fn_index)
         self.uses_segments_helper = True
-        return f"_scadtopy_segments({radius}, {fn}, {fa}, {fs})"
+        return f"_scadtopy_calculate_segments({radius}, {fn}, {fa}, {fs})"
+
+    def segment_tokens(self) -> tuple[str, str, str]:
+        if self.segment_overrides:
+            return self.segment_overrides
+        if self.in_module:
+            return (
+                "_scadtopy_special_fn",
+                "_scadtopy_special_fa",
+                "_scadtopy_special_fs",
+            )
+        return (
+            "_scadtopy_default_fn",
+            "_scadtopy_default_fa",
+            "_scadtopy_default_fs",
+        )
 
     def segment_settings(
         self,
         arguments: list[object],
         positional_fn_index: int = -1,
     ) -> tuple[str, str, str]:
-        fn, fa, fs = self.segment_overrides or (
-            "_scadtopy_default_fn",
-            "_scadtopy_default_fa",
-            "_scadtopy_default_fs",
-        )
+        fn, fa, fs = self.segment_tokens()
         fn_override = self.argument_value(arguments, ("$fn",), positional_fn_index)
         fa_override = self.argument_value(arguments, ("$fa",), -1)
         fs_override = self.argument_value(arguments, ("$fs",), -1)
@@ -1692,11 +1693,7 @@ class _Translator:
             else:
                 self.unsupported(argument)
 
-        current_fn, current_fa, current_fs = self.segment_overrides or (
-            "_scadtopy_default_fn",
-            "_scadtopy_default_fa",
-            "_scadtopy_default_fs",
-        )
+        current_fn, current_fa, current_fs = self.segment_tokens()
         inherited = {
             "$fn": current_fn,
             "$fa": current_fa,
@@ -1871,12 +1868,8 @@ class _Translator:
         if isinstance(node, Identifier):
             if node.name == "$children":
                 return "len(_children)"
-            if node.name == "$fn":
-                return "_scadtopy_default_fn"
-            if node.name == "$fa":
-                return "_scadtopy_default_fa"
-            if node.name == "$fs":
-                return "_scadtopy_default_fs"
+            if node.name in ("$fn", "$fa", "$fs"):
+                return self.segment_tokens()["$fn $fa $fs".split().index(node.name)]
             if node.name == "PI":
                 self.uses_math = True
                 return "math.pi"
@@ -1941,7 +1934,11 @@ class _Translator:
                 return f"{receiver}[{int(node.index.val)}]"
             return f"{receiver}[int({self.expression(node.index)})]"
         if isinstance(node, PrimaryMember):
-            return f"{_receiver(self.expression(node.left))}.{node.member.name}"
+            receiver = _receiver(self.expression(node.left))
+            index = {"x": 0, "y": 1, "z": 2}.get(node.member.name)
+            if index is not None:
+                return f"{receiver}[{index}]"
+            return f"{receiver}.{node.member.name}"
 
         name = _node_name(node)
         if name in _BINARY_OPERATORS:

@@ -42,7 +42,7 @@ class TranslatorTests(unittest.TestCase):
         self.assertIn(
             "difference(cube([10.0, 20.0, 30.0], center=True), "
             "_scadtopy_translate(sphere(radius=4.0, "
-            "segments=_scadtopy_segments("
+            "segments=_scadtopy_calculate_segments("
             "4.0, int(32.0), _scadtopy_default_fa, _scadtopy_default_fs)), "
             "[1.0, 2.0, 3.0]))",
             generated,
@@ -60,7 +60,7 @@ class TranslatorTests(unittest.TestCase):
 
         self.assertIn("size = 8.0", generated)
         self.assertIn(
-            "def box(width=size, _scadtopy_special_fn=0, "
+            "def box(width=size, _scadtopy_special_fn=None, "
             "_scadtopy_special_fa=None, _scadtopy_special_fs=None):",
             generated,
         )
@@ -79,12 +79,12 @@ class TranslatorTests(unittest.TestCase):
         tapered = self.translate("cylinder(h=12, r1=2, r2=4);")
 
         self.assertIn(
-            "circle(radius=10.0 / 2, segments=_scadtopy_segments("
+            "circle(radius=10.0 / 2, segments=_scadtopy_calculate_segments("
             "10.0 / 2, int(24.0), _scadtopy_default_fa, _scadtopy_default_fs))",
             circle,
         )
         self.assertIn(
-            "cylinder(12.0, 3.0, segments=_scadtopy_segments("
+            "cylinder(12.0, 3.0, segments=_scadtopy_calculate_segments("
             "3.0, _scadtopy_default_fn, _scadtopy_default_fa, "
             "_scadtopy_default_fs), center=True)",
             cylinder,
@@ -98,34 +98,28 @@ class TranslatorTests(unittest.TestCase):
         compile(cylinder, "<generated-cylinder>", "exec")
         compile(tapered, "<generated-tapered-cylinder>", "exec")
 
-    def test_top_level_fn_sets_piecad_default_segments(self) -> None:
+    def test_top_level_fn_sets_default_segments_global(self) -> None:
         generated = self.translate("$fn = 48; sphere(5);")
 
         self.assertIn("_scadtopy_default_fn = int(48.0)", generated)
-        self.assertIn("Config.set_default_segments(_scadtopy_default_fn)", generated)
         self.assertNotIn("$fn =", generated)
         self.assertIn(
-            "sphere(5.0, segments=_scadtopy_segments("
+            "sphere(5.0, segments=_scadtopy_calculate_segments("
             "5.0, _scadtopy_default_fn, _scadtopy_default_fa, "
             "_scadtopy_default_fs))",
             generated,
         )
         compile(generated, "<generated-default-segments>", "exec")
 
-        from piecad import Config
-
-        original_segments = Config._default_segments
-        try:
-            exec(generated, {})
-            self.assertEqual(Config._default_segments, 48)
-        finally:
-            Config.set_default_segments(original_segments)
+        namespace: dict[str, object] = {}
+        exec(generated, namespace)
+        self.assertEqual(namespace["_scadtopy_default_fn"], 48)
 
     def test_warns_for_other_top_level_special_settings(self) -> None:
         generated = self.translate("$fa = 3; $fs = 2; $preview = true; cube(1);")
 
-        self.assertIn("Config.set_default_min_angle(3.0)", generated)
-        self.assertIn("Config.set_default_min_segment_length(2.0)", generated)
+        self.assertIn("_scadtopy_default_fa = 3.0", generated)
+        self.assertIn("_scadtopy_default_fs = 2.0", generated)
         self.assertIn("# UNSUPPORTED: $preview = True", generated)
         self.assertNotIn("$fa =", generated)
         compile(generated, "<generated-special-settings>", "exec")
@@ -173,7 +167,7 @@ class TranslatorTests(unittest.TestCase):
 
         self.assertIn("def min_angle():\n    return _scadtopy_default_fa", generated)
         self.assertIn(
-            "segments=_scadtopy_segments("
+            "segments=_scadtopy_calculate_segments("
             "5.0, int(0.0), min_angle(), _scadtopy_default_fs)",
             generated,
         )
@@ -196,16 +190,16 @@ class TranslatorTests(unittest.TestCase):
         )
 
         self.assertIn(
-            "def lowres(_scadtopy_special_fn=0, _scadtopy_special_fa=None, "
+            "def lowres(_scadtopy_special_fn=None, _scadtopy_special_fa=None, "
             "_scadtopy_special_fs=None):",
             generated,
         )
-        self.assertIn("    _scadtopy_default_fn = int(0.0)", generated)
-        self.assertIn("    _scadtopy_default_fa = 6.0", generated)
-        self.assertIn("    _scadtopy_default_fs = 1.0", generated)
+        self.assertIn("    _scadtopy_special_fn = int(0.0)", generated)
+        self.assertIn("    _scadtopy_special_fa = 6.0", generated)
+        self.assertIn("    _scadtopy_special_fs = 1.0", generated)
         self.assertIn(
-            "_scadtopy_segments(5.0, _scadtopy_default_fn, "
-            "_scadtopy_default_fa, _scadtopy_default_fs)",
+            "_scadtopy_calculate_segments(5.0, _scadtopy_special_fn, "
+            "_scadtopy_special_fa, _scadtopy_special_fs)",
             generated,
         )
         namespace: dict[str, object] = {}
@@ -219,7 +213,7 @@ class TranslatorTests(unittest.TestCase):
             "wrapper($fn=8, $fa=6, $fs=1);"
         )
 
-        self.assertIn("_scadtopy_special_fn=0", generated)
+        self.assertIn("_scadtopy_special_fn=None", generated)
         self.assertIn("_scadtopy_special_fa=None", generated)
         self.assertIn("_scadtopy_special_fs=None", generated)
         self.assertIn(
@@ -228,9 +222,9 @@ class TranslatorTests(unittest.TestCase):
             generated,
         )
         self.assertIn(
-            "part(_scadtopy_special_fn=_scadtopy_default_fn, "
-            "_scadtopy_special_fa=_scadtopy_default_fa, "
-            "_scadtopy_special_fs=_scadtopy_default_fs)",
+            "part(_scadtopy_special_fn=_scadtopy_special_fn, "
+            "_scadtopy_special_fa=_scadtopy_special_fa, "
+            "_scadtopy_special_fs=_scadtopy_special_fs)",
             generated,
         )
         namespace: dict[str, object] = {}
@@ -244,7 +238,7 @@ class TranslatorTests(unittest.TestCase):
         )
 
         self.assertIn("# header", generated)
-        self.assertIn("Config.set_default_min_angle(3.0)  # setting note", generated)
+        self.assertIn("_scadtopy_default_fa = 3.0  # setting note", generated)
         self.assertIn("# paragraph one", generated)
         self.assertIn("# paragraph two", generated)
         self.assertIn("_parts.append(cube(1.0))  # geometry note", generated)
@@ -519,7 +513,7 @@ class TranslatorTests(unittest.TestCase):
             """)
 
         self.assertIn(
-            "def repeated(count=3.0, _scadtopy_special_fn=0, "
+            "def repeated(count=3.0, _scadtopy_special_fn=None, "
             "_scadtopy_special_fa=None, _scadtopy_special_fs=None, _children=()):",
             generated,
         )
@@ -568,7 +562,7 @@ class TranslatorTests(unittest.TestCase):
 
         self.assertNotIn("FIXME", generated)
         self.assertIn(
-            ".offset(2.0, 'round', segments=_scadtopy_segments("
+            ".offset(2.0, 'round', segments=_scadtopy_calculate_segments("
             "2.0, _scadtopy_default_fn, _scadtopy_default_fa, "
             "_scadtopy_default_fs))",
             generated,
@@ -648,7 +642,7 @@ class TranslatorTests(unittest.TestCase):
             generated,
         )
         self.assertIn(
-            "_scadtopy_segments(max(abs(_scadtopy_profile",
+            "_scadtopy_calculate_segments(max(abs(_scadtopy_profile",
             generated,
         )
 
@@ -788,6 +782,21 @@ class TranslatorTests(unittest.TestCase):
         self.assertIn("Vec2.cross([1.0, 0.0], [0.0, 1.0])[2]", generated)
         self.assertIn("e = ceil(1.5)", generated)
 
+    def test_vector_members_map_to_tuple_indexes(self) -> None:
+        generated = self.translate(
+            "v = [1, 2, 3]; a = v.x; b = v.y; c = v.z; d = [4, 5].y;"
+        )
+
+        self.assertIn("a = v[0]", generated)
+        self.assertIn("b = v[1]", generated)
+        self.assertIn("c = v[2]", generated)
+        namespace: dict[str, object] = {}
+        exec(generated, namespace)
+        self.assertEqual(
+            (namespace["a"], namespace["b"], namespace["c"], namespace["d"]),
+            (1.0, 2.0, 3.0, 5.0),
+        )
+
     def test_group_and_modifiers(self) -> None:
         generated = self.translate(
             "group() { cube(1); sphere(1); } *cube(5); #cube(2); %sphere(2);"
@@ -795,13 +804,13 @@ class TranslatorTests(unittest.TestCase):
 
         self.assertIn(
             "_parts.append(union(cube(1.0), sphere(1.0, "
-            "segments=_scadtopy_segments(1.0, _scadtopy_default_fn, "
+            "segments=_scadtopy_calculate_segments(1.0, _scadtopy_default_fn, "
             "_scadtopy_default_fa, _scadtopy_default_fs))))",
             generated,
         )
         self.assertIn("_parts.append(cube(2.0))", generated)
         self.assertIn(
-            "_parts.append(sphere(2.0, segments=_scadtopy_segments("
+            "_parts.append(sphere(2.0, segments=_scadtopy_calculate_segments("
             "2.0, _scadtopy_default_fn, _scadtopy_default_fa, "
             "_scadtopy_default_fs)))",
             generated,
@@ -904,7 +913,7 @@ class TranslatorTests(unittest.TestCase):
 
         self.assertIn(
             "cube(1.0).minkowski_sum(sphere(1.0, "
-            "segments=_scadtopy_segments(1.0, _scadtopy_default_fn, "
+            "segments=_scadtopy_calculate_segments(1.0, _scadtopy_default_fn, "
             "_scadtopy_default_fa, _scadtopy_default_fs)))",
             generated,
         )
