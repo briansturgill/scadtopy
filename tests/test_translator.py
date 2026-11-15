@@ -274,6 +274,8 @@ class TranslatorTests(unittest.TestCase):
             empty = [5:0];
             """)
 
+        self.assertIn("frange(1.0, 1.0, 3.0)", generated)
+        self.assertNotIn("_scadtopy_range", generated)
         namespace: dict[str, object] = {}
         exec(generated, namespace)
         self.assertEqual(namespace["implicit"], [1.0, 2.0, 3.0])
@@ -586,6 +588,100 @@ class TranslatorTests(unittest.TestCase):
         self.assertEqual(namespace["square_"](3), 9)
         self.assertEqual(namespace["_parts"][0].bounding_box()[3], 5.0)
 
+    def test_forward_function_and_module_declarations(self) -> None:
+        generated = self.translate("""
+            width = 4;
+            diameter = square(2);
+            translate([diameter, 0, 0]) cube(1);
+            future_shape();
+            module future_shape(size=width) { cube(size * square(3)); }
+            function square(value) = value * value;
+            """)
+
+        self.assertLess(
+            generated.index("def future_shape("),
+            generated.index("diameter ="),
+        )
+        self.assertLess(
+            generated.index("def square_("),
+            generated.index("diameter ="),
+        )
+        namespace: dict[str, object] = {}
+        exec(generated, namespace)
+        parts = namespace["_parts"]
+        self.assertEqual(len(parts), 2)
+        self.assertEqual(parts[0].bounding_box(), (4.0, 0.0, 0.0, 5.0, 1.0, 1.0))
+        self.assertEqual(parts[1].bounding_box(), (0.0, 0.0, 0.0, 36.0, 36.0, 36.0))
+
+    def test_ignores_convexity_and_nonexistent_center_arguments(self) -> None:
+        generated = self.translate(
+            "polygon(points=[[0,0],[4,0],[0,4]], convexity=2);\n"
+            "translate([1,2,3], center=true) cube(1);\n"
+            "circle(center=true, r=2);\n"
+            "sphere(r=1, center=true);\n"
+            "scale([2,2,2], center=true) cube(1);\n"
+            "module custom(center=false) { cube(center ? 2 : 1, center=center); }\n"
+            "custom(center=true);\n"
+        )
+
+        self.assertNotIn("FIXME", generated)
+        self.assertNotIn("convexity", generated)
+        self.assertNotIn("circle(center", generated)
+        self.assertNotIn("sphere(center", generated)
+        namespace: dict[str, object] = {}
+        exec(generated, namespace)
+        parts = namespace["_parts"]
+        self.assertEqual(parts[1].bounding_box(), (1.0, 2.0, 3.0, 2.0, 3.0, 4.0))
+        self.assertAlmostEqual(parts[2].bounding_box()[0], -2.0, places=1)
+        self.assertEqual(parts[4].bounding_box(), (0.0, 0.0, 0.0, 2.0, 2.0, 2.0))
+        # A user module's own `center` parameter must still be passed through.
+        self.assertEqual(parts[5].bounding_box(), (-1.0, -1.0, -1.0, 1.0, 1.0, 1.0))
+
+    def test_cylinder_height_defaults_to_one(self) -> None:
+        generated = self.translate("cylinder(r=2);")
+
+        self.assertNotIn("FIXME", generated)
+        namespace: dict[str, object] = {}
+        exec(generated, namespace)
+        self.assertAlmostEqual(namespace["_parts"][0].bounding_box()[5], 1.0)
+
+    def test_required_parameter_after_default_gets_undef_default(self) -> None:
+        generated = self.translate(
+            "module m(a, b=2, c) { cube(a + b); }\n"
+            "function f(a=1, b) = a;\n"
+            "m(1); echo(f());\n"
+        )
+
+        self.assertIn("def m(a, b=2.0, c=None", generated)
+        self.assertIn("def f(a=1.0, b=None)", generated)
+        compile(generated, "<generated-parameters>", "exec")
+
+    def test_comment_before_named_argument_name(self) -> None:
+        generated = self.translate(
+            "module box(size=1) { cube(size); }\n" "box(/* the size */ size = 3);\n"
+        )
+
+        self.assertNotIn("FIXME", generated)
+        namespace: dict[str, object] = {}
+        exec(generated, namespace)
+        self.assertEqual(
+            namespace["_parts"][0].bounding_box(), (0.0, 0.0, 0.0, 3.0, 3.0, 3.0)
+        )
+
+    def test_forward_module_dependency_is_hoisted(self) -> None:
+        generated = self.translate("""
+            module outer_shape() { inner_shape(); }
+            outer_shape();
+            module inner_shape() { cube(2); }
+            """)
+
+        namespace: dict[str, object] = {}
+        exec(generated, namespace)
+        self.assertEqual(
+            namespace["_parts"][0].bounding_box(),
+            (0.0, 0.0, 0.0, 2.0, 2.0, 2.0),
+        )
+
     def test_translates_twisted_linear_extrude_and_rotate_extrude(self) -> None:
         generated = self.translate("""
             linear_extrude(height=10, twist=90, slices=10, scale=2) square(4, center=true);
@@ -871,12 +967,15 @@ class TranslatorTests(unittest.TestCase):
     def test_import_maps_to_piecad_load_and_version_is_a_tuple(self) -> None:
         generated = self.translate(
             'import("part.stl"); import(file="part.3mf", convexity=2);'
-            'import("drawing.svg"); v = version();'
+            'import("drawing.svg"); import("drawing.dxf"); v = version();'
         )
 
         self.assertIn("_parts.append(load('part.stl'))", generated)
         self.assertIn("_parts.append(load('part.3mf'))", generated)
-        self.assertIn("import() of .svg files is not supported", generated)
+        self.assertIn("_parts.append(load('drawing.svg'))", generated)
+        self.assertIn("_parts.append(load('drawing.dxf'))", generated)
+        self.assertNotIn("import() of .svg files is not supported", generated)
+        self.assertNotIn("import() of .dxf files is not supported", generated)
         self.assertIn("v = tuple(map(int, version().split('.')))", generated)
 
     def test_export_comment_saves_the_part_to_its_own_file(self) -> None:

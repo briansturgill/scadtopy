@@ -58,16 +58,6 @@ from openscad_parser.ast.nodes import (
     UseStatement,
 )
 
-_RANGE_HELPER = """def _scadtopy_range(start, step, end):
-    if step == 0:
-        raise ValueError("OpenSCAD range step cannot be zero")
-    distance = (end - start) / step
-    if distance < 0:
-        return []
-    last_index = math.floor(math.nextafter(distance, math.inf))
-    return [start + index * step for index in range(last_index + 1)]"""
-
-
 class TranslationError(ValueError):
     """Raised for malformed input or invalid arguments to supported constructs."""
 
@@ -252,6 +242,39 @@ def _unsupported_special_variables(node: object) -> set[str]:
     return set()
 
 
+def _called_names(node: object) -> set[str]:
+    names: set[str] = set()
+    if isinstance(node, PrimaryCall) and isinstance(node.left, Identifier):
+        names.add(node.left.name)
+    elif isinstance(node, ModularCall):
+        names.add(node.name.name)
+    if isinstance(node, (list, tuple)):
+        for item in node:
+            names.update(_called_names(item))
+    elif hasattr(node, "__dict__"):
+        for key, value in vars(node).items():
+            if key != "position":
+                names.update(_called_names(value))
+    return names
+
+
+def _unwrap_commented_names(node: object) -> None:
+    """Replace comment-wrapped identifiers in `name` slots with the identifier."""
+    if isinstance(node, (list, tuple)):
+        for item in node:
+            _unwrap_commented_names(item)
+    elif hasattr(node, "__dict__"):
+        for key, value in vars(node).items():
+            if key == "position":
+                continue
+            if key == "name" and isinstance(value, CommentedExpr):
+                while isinstance(value, CommentedExpr):
+                    value = value.expr
+                setattr(node, key, value)
+            else:
+                _unwrap_commented_names(value)
+
+
 def _all_module_names(nodes: Iterable[object]) -> set[str]:
     names: set[str] = set()
     for node in nodes:
@@ -271,9 +294,11 @@ def _children_modules(nodes: Iterable[object]) -> set[str]:
     return names
 
 
+_CENTER_MODULES = frozenset({"cube", "square", "cylinder", "linear_extrude"})
+
 _EXPORT_COMMENT = re.compile(r"\s*export\s+(\S+\.\w+)\s*$", re.I)
 
-_PIECAD_LOAD_EXTENSIONS = {"3mf", "glb", "gltf", "obj", "ply", "stl"}
+_PIECAD_LOAD_EXTENSIONS = {"3mf", "dxf", "glb", "gltf", "obj", "ply", "stl", "svg"}
 _UNSUPPORTED_SPECIAL_VARIABLES = {"$t", "$preview", "$vpr", "$vpt", "$vpd"}
 
 
@@ -319,7 +344,6 @@ class _Translator:
         self.uses_translate_helper = False
         self.uses_resize_helper = False
         self.uses_segments_helper = False
-        self.uses_ranges = False
         self.uses_math = False
         self.segment_overrides: tuple[str, str, str] | None = None
         self.in_module = False
@@ -332,13 +356,13 @@ class _Translator:
 
     def translate(self, nodes: Iterable[object]) -> str:
         nodes = list(nodes)
+        _unwrap_commented_names(nodes)
         self.shadowing_names = {
             node.name.name
             for node in nodes
             if isinstance(node, (FunctionDeclaration, ModuleDeclaration))
             and node.name.name in _PIECAD_EXPORTS
         }
-        self.uses_ranges = False
         self.uses_math = False
         self.segment_overrides = None
         self.in_module = False
@@ -361,6 +385,28 @@ class _Translator:
         for node in nodes:
             if isinstance(node, UseStatement):
                 self.load_used_names(node)
+        declaration_indices: dict[str, int] = {}
+        for index, node in enumerate(nodes):
+            if isinstance(node, (FunctionDeclaration, ModuleDeclaration)):
+                declaration_indices.setdefault(node.name.name, index)
+        hoist_start = next(
+            (
+                index
+                for index, node in enumerate(nodes)
+                if any(
+                    declaration_indices.get(name, index) > index
+                    for name in _called_names(node)
+                )
+            ),
+            None,
+        )
+        hoisted_declarations: list[str] = []
+        if hoist_start is not None:
+            for node in nodes[hoist_start:]:
+                if isinstance(node, ModuleDeclaration):
+                    hoisted_declarations.extend(self.module_declaration(node))
+                elif isinstance(node, FunctionDeclaration):
+                    hoisted_declarations.extend(self.function_declaration(node))
         statements: list[str] = [
             "_parts = []",
             "_scadtopy_default_fn = Config.get_default_segments()",
@@ -372,7 +418,9 @@ class _Translator:
         exports: list[tuple[int, str]] = []
         last_statement_is_model = False
 
-        for node in nodes:
+        for index, node in enumerate(nodes):
+            if index == hoist_start:
+                statements.extend(hoisted_declarations)
             if isinstance(node, Assignment):
                 unsupported = _unsupported_special_variables(node.expr)
                 if unsupported:
@@ -395,10 +443,12 @@ class _Translator:
                     statements.append(f"{node.name.name} = {value}")
                 last_statement_is_model = False
             elif isinstance(node, ModuleDeclaration):
-                statements.extend(self.module_declaration(node))
+                if hoist_start is None or index < hoist_start:
+                    statements.extend(self.module_declaration(node))
                 last_statement_is_model = False
             elif isinstance(node, FunctionDeclaration):
-                statements.extend(self.function_declaration(node))
+                if hoist_start is None or index < hoist_start:
+                    statements.extend(self.function_declaration(node))
                 last_statement_is_model = False
             elif isinstance(node, ModuleInstantiation):
                 unsupported = _unsupported_special_variables(node)
@@ -481,11 +531,7 @@ class _Translator:
         statements.extend(self.fixmes)
         body = "\n".join(statements).rstrip()
         prefix = ""
-        if self.uses_ranges:
-            prefix = f"import math\n\n{_RANGE_HELPER}\n\n"
-        elif self.uses_math:
-            prefix = "import math\n\n"
-        if "round" in self.helpers and not prefix:
+        if self.uses_math or "round" in self.helpers:
             prefix = "import math\n\n"
         if "rands" in self.helpers:
             prefix += "import random\n\n"
@@ -901,15 +947,19 @@ class _Translator:
         ]
 
     def parameters(self, parameters: list[object]) -> str:
-        return ", ".join(
-            parameter.name.name
-            + (
-                f"={self.expression(parameter.default)}"
-                if parameter.default is not None
-                else ""
-            )
-            for parameter in parameters
-        )
+        rendered: list[str] = []
+        seen_default = False
+        for parameter in parameters:
+            text = parameter.name.name
+            if parameter.default is not None:
+                seen_default = True
+                text += f"={self.expression(parameter.default)}"
+            elif seen_default:
+                # Python forbids a required parameter after a defaulted one;
+                # an omitted OpenSCAD parameter is undef.
+                text += "=None"
+            rendered.append(text)
+        return ", ".join(rendered)
 
     def append_comment(
         self,
@@ -1032,6 +1082,16 @@ class _Translator:
             return "None"
 
         name = node.name.name
+        if name not in self.module_names and name not in _CENTER_MODULES:
+            # OpenSCAD silently ignores arguments a built-in doesn't have.
+            node.arguments = [
+                argument
+                for argument in node.arguments
+                if not (
+                    isinstance(argument, NamedArgument)
+                    and argument.name.name == "center"
+                )
+            ]
         arguments = self.call_arguments(node.arguments)
         previous_segment_overrides = self.segment_overrides
         if name in {"linear_extrude", "offset", "rotate_extrude"}:
@@ -1488,7 +1548,9 @@ class _Translator:
         unexpected = {
             argument.name.name
             for argument in node.arguments
-            if isinstance(argument, NamedArgument) and argument.name.name not in allowed
+            if isinstance(argument, NamedArgument)
+            and argument.name.name not in allowed
+            and argument.name.name != "convexity"
         }
         if unexpected:
             raise TranslationError(
@@ -1517,7 +1579,7 @@ class _Translator:
         d2 = self.argument_value(node.arguments, ("d2",), -1)
         center = self.argument_value(node.arguments, ("center",), 2)
         if height is None:
-            raise TranslationError(f"cylinder() requires height{_position(node)}")
+            height = "1.0"
         unsupported_arguments = {
             argument.name.name
             for argument in node.arguments
@@ -1607,6 +1669,8 @@ class _Translator:
                 positional_index += 1
             elif isinstance(argument, NamedArgument):
                 if argument.name.name in {"$fn", "$fa", "$fs", "segments"}:
+                    continue
+                if argument.name.name == "convexity":
                     continue
                 name = aliases.get(argument.name.name, argument.name.name)
                 if name.startswith("$"):
@@ -1883,9 +1947,8 @@ class _Translator:
         if isinstance(node, UndefinedLiteral):
             return "None"
         if isinstance(node, RangeLiteral):
-            self.uses_ranges = True
             return (
-                f"_scadtopy_range({self.expression(node.start)}, "
+                f"frange({self.expression(node.start)}, "
                 f"{self.expression(node.step)}, {self.expression(node.end)})"
             )
         if isinstance(node, LetOp):
