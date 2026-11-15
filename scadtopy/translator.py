@@ -353,6 +353,7 @@ class _Translator:
         self.uses_vec2 = False
         self.helpers: set[str] = set()
         self.module_names: set[str] = set()
+        self.geometry_modules: dict[str, ModuleDeclaration] = {}
         self.shadowing_names: set[str] = set()
         self.children_modules: set[str] = set()
         self.uses_children_helper = False
@@ -410,6 +411,19 @@ class _Translator:
         }
         self.module_names = _all_module_names(nodes)
         self.children_modules = _children_modules(nodes)
+        declarations = [node for node in nodes if isinstance(node, ModuleDeclaration)]
+        nested_names = set().union(
+            *(_all_module_names(node.children) for node in declarations)
+        )
+        self.geometry_modules = {
+            node.name.name: node
+            for node in declarations
+            if node.name.name not in nested_names
+            and sum(other.name.name == node.name.name for other in declarations) == 1
+            and not _uses_children(node.children)
+        }
+        if any(isinstance(node, UseStatement) for node in nodes):
+            self.geometry_modules.clear()
         for node in nodes:
             if isinstance(node, UseStatement):
                 self.load_used_names(node)
@@ -1605,6 +1619,24 @@ class _Translator:
                     f"translate() requires one vector{_position(node)}"
                 )
             rendered = self.expression(vector)
+            dimensions = self.geometry_dimension(node.children)
+            if dimensions == 2:
+                parsed = ast.parse(rendered, mode="eval").body
+                if isinstance(parsed, ast.List) and len(parsed.elts) == 2:
+                    pass
+                elif (
+                    isinstance(parsed, ast.List)
+                    and len(parsed.elts) == 3
+                    and isinstance(parsed.elts[2], ast.Constant)
+                ):
+                    rendered = ast.unparse(
+                        ast.List(elts=parsed.elts[:2], ctx=ast.Load())
+                    )
+                else:
+                    rendered = f"({rendered})[:2]"
+                return f"{_receiver(geometry)}.translate({rendered})"
+            if dimensions == 3:
+                return f"{_receiver(geometry)}.translate({rendered})"
             self.uses_translate_helper = True
             return f"_scadtopy_translate({_receiver(geometry)}, {rendered})"
 
@@ -1987,6 +2019,82 @@ class _Translator:
         return (
             geometries[0] if len(geometries) == 1 else f"union({', '.join(geometries)})"
         )
+
+    def geometry_dimension(
+        self, nodes: object, active_modules: frozenset[str] = frozenset()
+    ) -> int | None:
+        if isinstance(nodes, (list, tuple)):
+            children = [
+                node
+                for node in nodes
+                if isinstance(node, ModuleInstantiation)
+                and not isinstance(node, ModularModifierDisable)
+                and not (
+                    isinstance(node, (ModularAssert, ModularEcho)) and not node.children
+                )
+            ]
+            if not children:
+                return None
+            dimensions = {
+                self.geometry_dimension(child, active_modules) for child in children
+            }
+            return dimensions.pop() if len(dimensions) == 1 else None
+        if isinstance(nodes, (ModularModifierHighlight, ModularModifierBackground)):
+            return self.geometry_dimension(nodes.child, active_modules)
+        if isinstance(nodes, (ModularFor, ModularIntersectionFor)):
+            return self.geometry_dimension(nodes.body, active_modules)
+        if isinstance(nodes, ModularIfElse):
+            first = self.geometry_dimension(nodes.true_branch, active_modules)
+            second = self.geometry_dimension(nodes.false_branch, active_modules)
+            return first if first == second else None
+        if isinstance(nodes, ModularIf):
+            return self.geometry_dimension(nodes.true_branch, active_modules)
+        if isinstance(nodes, (ModularLet, ModularAssert, ModularEcho)):
+            return self.geometry_dimension(nodes.children, active_modules)
+        if not isinstance(nodes, ModularCall):
+            return None
+        name = nodes.name.name
+        if name == "import":
+            file_node = self.argument_expression(nodes.arguments, ("file",), 0)
+            if isinstance(file_node, StringLiteral):
+                extension = file_node.val.rpartition(".")[2].lower()
+                if extension in _PIECAD_LOAD_EXTENSIONS:
+                    return 2 if extension in {"svg", "dxf"} else 3
+            return None
+        if name in {"square", "circle", "polygon", "text", "projection", "offset"}:
+            return 2
+        if name in {
+            "cube",
+            "sphere",
+            "cylinder",
+            "polyhedron",
+            "linear_extrude",
+            "rotate_extrude",
+            "minkowski",
+        }:
+            return 3
+        if name in {
+            "translate",
+            "rotate",
+            "scale",
+            "mirror",
+            "resize",
+            "multmatrix",
+            "color",
+            "render",
+            "group",
+            "union",
+            "difference",
+            "intersection",
+            "hull",
+        }:
+            return self.geometry_dimension(nodes.children, active_modules)
+        declaration = self.geometry_modules.get(name)
+        if declaration is not None and name not in active_modules:
+            return self.geometry_dimension(
+                declaration.children, active_modules | {name}
+            )
+        return None
 
     def note_fixme(self, node: object, message: str) -> None:
         line = _position(node).removeprefix(" at line ")

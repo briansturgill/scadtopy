@@ -41,10 +41,10 @@ class TranslatorTests(unittest.TestCase):
 
         self.assertIn(
             "difference(cube([10.0, 20.0, 30.0], center=True), "
-            "_scadtopy_translate(sphere(radius=4.0, "
+            "sphere(radius=4.0, "
             "segments=_scadtopy_calculate_segments("
-            "4.0, int(32.0), _scadtopy_default_fa, _scadtopy_default_fs)), "
-            "[1.0, 2.0, 3.0]))",
+            "4.0, int(32.0), _scadtopy_default_fa, _scadtopy_default_fs))."
+            "translate([1.0, 2.0, 3.0]))",
             generated,
         )
         compile(generated, "<generated>", "exec")
@@ -1037,8 +1037,9 @@ class TranslatorTests(unittest.TestCase):
             "translate([1,2,3]) square(2);\ntranslate([1,2,3]) cube(2);\n"
         )
 
-        self.assertIn("_scadtopy_translate(square(2.0), [1.0, 2.0, 3.0])", generated)
-        self.assertIn("_scadtopy_translate(cube(2.0), [1.0, 2.0, 3.0])", generated)
+        self.assertIn("square(2.0).translate([1.0, 2.0])", generated)
+        self.assertIn("cube(2.0).translate([1.0, 2.0, 3.0])", generated)
+        self.assertNotIn("_scadtopy_translate", generated)
         namespace: dict[str, object] = {}
         exec(generated, namespace)
         self.assertEqual(len(namespace["_parts"]), 2)
@@ -1047,11 +1048,77 @@ class TranslatorTests(unittest.TestCase):
         generated = self.translate(
             "module flat() square(2); translate([1, 2, 3]) flat();"
         )
+        self.assertNotIn("_scadtopy_translate", generated)
+        self.assertIn(".translate([1.0, 2.0])", generated)
         namespace: dict[str, object] = {}
         exec(generated, namespace)
 
         model = namespace["_parts"][0]
         self.assertEqual(model.bounding_box(), (1.0, 2.0, 3.0, 4.0))
+
+    def test_translate_preserves_dynamic_dimensions_and_vector_evaluation(self) -> None:
+        generated = self.translate("""
+            module shape(flat) { if (flat) square(2); else cube(2); }
+            function value() = echo("z") 3;
+            vector = [1, 2, 3];
+            translate(vector) square(2);
+            translate([1, 2, value()]) square(2);
+            translate(vector) shape(true);
+            translate(vector) shape(false);
+            """)
+        self.assertIn("square(2.0).translate(vector[:2])", generated)
+        self.assertIn("_scadtopy_translate(shape(", generated)
+        output = io.StringIO()
+        namespace: dict[str, object] = {}
+        with redirect_stdout(output):
+            exec(generated, namespace)
+        self.assertEqual(output.getvalue(), "z\n")
+        self.assertEqual(
+            [part.bounding_box() for part in namespace["_parts"]],
+            [(1, 2, 3, 4), (1, 2, 3, 4), (1, 2, 3, 4), (1, 2, 3, 3, 4, 5)],
+        )
+
+    def test_translate_known_composite_dimensions(self) -> None:
+        generated = self.translate("""
+            translate([1,2,3]) union() { square(1); circle(1); }
+            translate([1,2,3]) projection() cube(2);
+            translate([1,2,3]) linear_extrude(2) square(1);
+            """)
+        self.assertNotIn("_scadtopy_translate", generated)
+        namespace: dict[str, object] = {}
+        exec(generated, namespace)
+        self.assertEqual(len(namespace["_parts"][0].bounding_box()), 4)
+        self.assertEqual(len(namespace["_parts"][1].bounding_box()), 4)
+        self.assertEqual(namespace["_parts"][2].bounding_box(), (1, 2, 3, 2, 3, 5))
+
+    def test_translate_infers_nested_user_modules_and_matching_branches(self) -> None:
+        generated = self.translate("""
+            module flat(flag) { if (flag) square(2); else circle(2); }
+            module wrapped() { flat(true); }
+            translate([1,2,3]) wrapped();
+            """)
+        self.assertNotIn("_scadtopy_translate", generated)
+        self.assertIn(".translate([1.0, 2.0])", generated)
+        namespace: dict[str, object] = {}
+        exec(generated, namespace)
+        self.assertEqual(namespace["_parts"][0].bounding_box(), (1, 2, 3, 4))
+
+    def test_translate_infers_import_dimensions(self) -> None:
+        from piecad import cube, square
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            generated = self.translate("""
+                translate([1,2,3]) import("drawing.svg");
+                translate([1,2,3]) import("part.stl");
+                """)
+        self.assertIn("load('drawing.svg').translate([1.0, 2.0])", generated)
+        self.assertIn("load('part.stl').translate([1.0, 2.0, 3.0])", generated)
+        with patch("piecad.load", side_effect=[square(1), cube(1)]):
+            namespace: dict[str, object] = {}
+            exec(generated, namespace)
+        self.assertEqual(namespace["_parts"][0].bounding_box(), (1, 2, 2, 3))
+        self.assertEqual(namespace["_parts"][1].bounding_box(), (1, 2, 3, 2, 3, 4))
 
     def test_runtime_geometry_type_selects_auto_save_format(self) -> None:
         cases = (
@@ -1309,7 +1376,7 @@ class TranslatorTests(unittest.TestCase):
         self.assertIn(".project()", shadow)
         self.assertIn(".slice(0)", cut)
         self.assertIn(
-            "_scadtopy_translate(cube(2.0).project(), [10.0, 20.0, 30.0])",
+            "cube(2.0).project().translate([10.0, 20.0])",
             translated,
         )
         self.assertNotIn("_scadtopy_combine_models", mixed)
@@ -1343,7 +1410,7 @@ class TranslatorTests(unittest.TestCase):
             }
             """)
 
-        self.assertIn("_scadtopy_translate(cube(1.0), [1.0, 0.0, 0.0])", generated)
+        self.assertIn("cube(1.0).translate([1.0, 0.0, 0.0])", generated)
         self.assertIn(".rotate([0, 0, -30.0])", generated)
         self.assertIn(".scale([2.0, 2.0, 2.0])", generated)
         self.assertIn(".mirror((False, True, False))", generated)
