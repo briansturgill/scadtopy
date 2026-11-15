@@ -45,7 +45,7 @@ class TranslatorTests(unittest.TestCase):
             "difference(cube([10.0, 20.0, 30.0], center=True), "
             "sphere(radius=4.0, "
             "segments=_scadtopy_calculate_segments("
-            "4.0, int(32.0), _scadtopy_default_fa, _scadtopy_default_fs))."
+            "4.0, fn=int(32.0)))."
             "translate([1.0, 2.0, 3.0]))",
             generated,
         )
@@ -184,13 +184,12 @@ class TranslatorTests(unittest.TestCase):
 
         self.assertIn(
             "circle(radius=10.0 / 2, segments=_scadtopy_calculate_segments("
-            "10.0 / 2, int(24.0), _scadtopy_default_fa, _scadtopy_default_fs))",
+            "10.0 / 2, fn=int(24.0)))",
             circle,
         )
         self.assertIn(
             "cylinder(12.0, 3.0, segments=_scadtopy_calculate_segments("
-            "3.0, _scadtopy_default_fn, _scadtopy_default_fa, "
-            "_scadtopy_default_fs), center=True)",
+            "3.0), center=True)",
             cylinder,
         )
         self.assertIn(
@@ -222,15 +221,86 @@ class TranslatorTests(unittest.TestCase):
             [32, 32],
         )
 
+    def test_segment_defaults_are_resolved_at_each_call(self) -> None:
+        from piecad import sphere
+
+        generated = self.translate(
+            "$fn=8; sphere(2); $fn=16; sphere(2); " "sphere(2, $fn=6);"
+        )
+        self.assertIn("_scadtopy_calculate_segments(2.0)", generated)
+        self.assertIn("_scadtopy_calculate_segments(2.0, fn=int(6.0))", generated)
+
+        with patch("piecad.sphere", wraps=sphere) as sphere_call:
+            exec(generated, {})
+        self.assertEqual(
+            [call.kwargs["segments"] for call in sphere_call.call_args_list],
+            [8, 16, 6],
+        )
+
+    def test_segment_explicit_undef_does_not_use_translated_default(self) -> None:
+        from piecad import Config
+
+        generated = self.translate("$fa=6; sphere(5, $fa=undef, $fs=1);")
+        self.assertIn("_scadtopy_calculate_segments(5.0, fa=None, fs=1.0)", generated)
+
+        with patch.object(
+            Config,
+            "calculate_default_segments",
+            wraps=Config.calculate_default_segments,
+        ) as calculate:
+            exec(generated, {})
+        self.assertEqual(calculate.call_args.args, (5.0, None, 1.0))
+
+    def test_segment_angle_and_length_defaults_and_overrides(self) -> None:
+        from piecad import Config
+
+        generated = self.translate(
+            "$fa=6; $fs=1; sphere(5); "
+            "$fa=30; $fs=4; sphere(5); "
+            "sphere(5, $fa=18); sphere(5, $fs=2);"
+        )
+        self.assertIn("_scadtopy_calculate_segments(5.0, fa=18.0)", generated)
+        self.assertIn("_scadtopy_calculate_segments(5.0, fs=2.0)", generated)
+        with patch.object(
+            Config,
+            "calculate_default_segments",
+            wraps=Config.calculate_default_segments,
+        ) as calculate:
+            exec(generated, {})
+        self.assertEqual(
+            [call.args for call in calculate.call_args_list],
+            [(5, 6, 1), (5, 30, 4), (5, 18, 4), (5, 30, 2)],
+        )
+
+    def test_segment_defaults_are_read_before_later_effectful_arguments(self) -> None:
+        from piecad import sphere
+
+        generated = self.translate("$fn=8; sphere(2, $fa=change());")
+        namespace: dict[str, object] = {}
+
+        def change() -> int:
+            namespace["_scadtopy_default_fn"] = 16
+            return 6
+
+        namespace["change"] = change
+        with patch("piecad.sphere", wraps=sphere) as sphere_call:
+            exec(generated, namespace)
+        self.assertEqual(sphere_call.call_args.kwargs["segments"], 8)
+
+    def test_segment_default_sentinel_avoids_user_identifiers(self) -> None:
+        generated = self.translate("_scadtopy_unset=42; sphere(2);")
+        namespace: dict[str, object] = {}
+        exec(generated, namespace)
+        self.assertEqual(namespace["_scadtopy_unset"], 42)
+        self.assertFalse(namespace["_parts"][0].is_empty())
+
     def test_top_level_fn_sets_default_segments_global(self) -> None:
         generated = self.translate("$fn = 48; sphere(5);")
 
         self.assertIn("_scadtopy_default_fn = int(48.0)", generated)
         self.assertNotIn("$fn =", generated)
         self.assertIn(
-            "sphere(5.0, segments=_scadtopy_calculate_segments("
-            "5.0, _scadtopy_default_fn, _scadtopy_default_fa, "
-            "_scadtopy_default_fs))",
+            "sphere(5.0, segments=_scadtopy_calculate_segments(" "5.0))",
             generated,
         )
         compile(generated, "<generated-default-segments>", "exec")
@@ -292,7 +362,7 @@ class TranslatorTests(unittest.TestCase):
         self.assertIn("def min_angle():\n    return _scadtopy_default_fa", generated)
         self.assertIn(
             "segments=_scadtopy_calculate_segments("
-            "5.0, int(0.0), min_angle(), _scadtopy_default_fs)",
+            "5.0, fn=int(0.0), fa=min_angle())",
             generated,
         )
         namespace: dict[str, object] = {}
@@ -350,6 +420,114 @@ class TranslatorTests(unittest.TestCase):
         namespace: dict[str, object] = {}
         exec(generated, namespace)
         self.assertGreater(namespace["_parts"][0].num_verts(), 0)
+
+    def test_local_module_calls_omit_inherited_global_segment_settings(self) -> None:
+        from piecad import sphere
+
+        generated = self.translate("""
+            module part() sphere(2);
+            $fn=8; part();
+            $fn=16; part();
+            part($fn=12);
+            """)
+        self.assertEqual(generated.count("_parts.append(part())"), 2)
+        self.assertIn("_parts.append(part(_scadtopy_special_fn=int(12.0)))", generated)
+
+        with patch("piecad.sphere", wraps=sphere) as calls:
+            exec(generated, {})
+        self.assertEqual(
+            [call.kwargs["segments"] for call in calls.call_args_list], [8, 16, 12]
+        )
+
+    def test_local_module_calls_keep_scoped_segment_settings(self) -> None:
+        from piecad import sphere
+
+        generated = self.translate("""
+            module part() sphere(2);
+            module wrapper() part();
+            $fn=8;
+            wrapper($fn=24);
+            """)
+        self.assertIn("part(_scadtopy_special_fn=_scadtopy_special_fn", generated)
+        with patch("piecad.sphere", wraps=sphere) as calls:
+            exec(generated, {})
+        self.assertEqual(calls.call_args.kwargs["segments"], 24)
+
+    def test_local_module_calls_keep_explicit_transform_settings(self) -> None:
+        from piecad import circle
+
+        generated = self.translate(
+            "module profile() circle(2); "
+            "linear_extrude(height=4, twist=90, slices=4, $fn=8) profile();"
+        )
+        self.assertIn("profile(_scadtopy_special_fn=int(8.0))", generated)
+        with patch("piecad.circle", wraps=circle) as calls:
+            exec(generated, {})
+        self.assertEqual(calls.call_args.kwargs["segments"], 8)
+
+    def test_local_module_default_name_shadowing_keeps_explicit_argument(self) -> None:
+        from piecad import sphere
+
+        generated = self.translate(
+            "module part() { _scadtopy_default_fn=12; sphere(2); } " "$fn=8; part();"
+        )
+        self.assertIn("_scadtopy_special_fn=_scadtopy_default_fn", generated)
+        with patch("piecad.sphere", wraps=sphere) as calls:
+            exec(generated, {})
+        self.assertEqual(calls.call_args.kwargs["segments"], 8)
+
+    def test_local_module_nested_default_reads_inherited_settings(self) -> None:
+        generated = self.translate("""
+            module part() {
+                function size(value=$fn) = value;
+                cube(size());
+            }
+            $fn=8; part();
+            """)
+        namespace: dict[str, object] = {}
+        exec(generated, namespace)
+        self.assertEqual(namespace["_parts"][0].bounding_box(), (0, 0, 0, 8, 8, 8))
+
+    def test_local_module_nested_default_does_not_change_inherited_settings(
+        self,
+    ) -> None:
+        from piecad import sphere
+
+        generated = self.translate("""
+            module part() {
+                function value(arg=change()) = arg;
+                sphere(2);
+            }
+            $fn=8; part();
+            """)
+        namespace: dict[str, object] = {}
+
+        def change() -> int:
+            namespace["_scadtopy_default_fn"] = 16
+            return 1
+
+        namespace["change"] = change
+        with patch("piecad.sphere", wraps=sphere) as calls:
+            exec(generated, namespace)
+        self.assertEqual(calls.call_args.kwargs["segments"], 8)
+
+    def test_local_module_children_do_not_delay_inherited_settings(self) -> None:
+        from piecad import sphere
+
+        generated = self.translate("""
+            module part() { sphere(2); children(); }
+            $fn=8; part() cube(change());
+            """)
+        namespace: dict[str, object] = {}
+
+        def change() -> int:
+            namespace["_scadtopy_default_fn"] = 16
+            return 1
+
+        namespace["change"] = change
+        with patch("piecad.sphere", wraps=sphere) as calls:
+            exec(generated, namespace)
+        self.assertEqual(calls.call_args.kwargs["segments"], 8)
 
     def test_passes_through_comments_and_parser_blank_lines(self) -> None:
         generated = self.translate(
@@ -919,9 +1097,7 @@ class TranslatorTests(unittest.TestCase):
 
         self.assertNotIn("FIXME", generated)
         self.assertIn(
-            ".offset(2.0, 'round', segments=_scadtopy_calculate_segments("
-            "2.0, _scadtopy_default_fn, _scadtopy_default_fa, "
-            "_scadtopy_default_fs))",
+            ".offset(2.0, 'round', segments=_scadtopy_calculate_segments(" "2.0))",
             generated,
         )
         self.assertIn(".offset(1.0, 'miter', 1000.0)", generated)
@@ -1099,6 +1275,100 @@ class TranslatorTests(unittest.TestCase):
         self.assertEqual(len(namespace["_parts"]), 2)
         self.assertTrue(all(not part.is_empty() for part in namespace["_parts"]))
 
+    def test_linear_extrude_segment_defaults_and_override(self) -> None:
+        from piecad import extrude_transforming
+
+        generated = self.translate("""
+            angle = 90;
+            $fn = 8;
+            linear_extrude(10, twist=angle) square(2);
+            $fn = 16;
+            linear_extrude(10, twist=angle) square(2);
+            linear_extrude(10, twist=angle, $fn=12) square(2);
+            """)
+        self.assertIn(
+            "_scadtopy_linear_extrude(square(2.0), 10.0, False, angle, None, 1)",
+            generated,
+        )
+        self.assertIn(
+            "_scadtopy_linear_extrude(square(2.0), 10.0, False, angle, None, 1, "
+            "fn=int(12.0))",
+            generated,
+        )
+        with patch(
+            "piecad.extrude_transforming", wraps=extrude_transforming
+        ) as extrude:
+            exec(generated, {})
+        self.assertEqual([call.args[2] for call in extrude.call_args_list], [2, 4, 3])
+
+    def test_linear_extrude_reads_defaults_before_profile_operations(self) -> None:
+        from piecad import Obj2d, extrude_transforming
+
+        generated = self.translate(
+            "angle=90; $fn=8; linear_extrude(10, twist=angle) square(2);"
+        )
+        namespace: dict[str, object] = {}
+        bounding_box = Obj2d.bounding_box
+
+        def change_default(profile: Obj2d) -> tuple[float, ...]:
+            namespace["_scadtopy_default_fn"] = 16
+            return bounding_box(profile)
+
+        with (
+            patch.object(Obj2d, "bounding_box", change_default),
+            patch("piecad.extrude_transforming", wraps=extrude_transforming) as extrude,
+        ):
+            exec(generated, namespace)
+        self.assertEqual(extrude.call_args.args[2], 2)
+
+    def test_linear_extrude_preserves_explicit_undef_and_module_settings(self) -> None:
+        from piecad import Config, extrude_transforming
+
+        generated = self.translate("""
+            angle=90;
+            $fa=6;
+            linear_extrude(10, twist=angle, $fa=undef, $fs=1) square(2);
+            module part(twist) { linear_extrude(10, twist=twist) square(2); }
+            part(90, $fn=12);
+            """)
+        self.assertIn("angle, None, 1, fa=None, fs=1.0)", generated)
+        self.assertIn(
+            "twist, None, 1, _scadtopy_special_fn, "
+            "_scadtopy_special_fa, _scadtopy_special_fs)",
+            generated,
+        )
+        with (
+            patch.object(
+                Config,
+                "calculate_default_segments",
+                wraps=Config.calculate_default_segments,
+            ) as calculate,
+            patch("piecad.extrude_transforming", wraps=extrude_transforming) as extrude,
+        ):
+            exec(generated, {})
+        self.assertEqual(calculate.call_args.args[1:], (None, 1))
+        self.assertEqual(extrude.call_args_list[1].args[2], 3)
+
+    def test_linear_extrude_reads_defaults_before_effectful_overrides(self) -> None:
+        from piecad import extrude_transforming
+
+        generated = self.translate(
+            "angle=90; $fn=8; "
+            "linear_extrude(10, twist=angle, $fa=change()) square(2);"
+        )
+        namespace: dict[str, object] = {}
+
+        def change() -> int:
+            namespace["_scadtopy_default_fn"] = 16
+            return 6
+
+        namespace["change"] = change
+        with patch(
+            "piecad.extrude_transforming", wraps=extrude_transforming
+        ) as extrude:
+            exec(generated, namespace)
+        self.assertEqual(extrude.call_args.args[2], 2)
+
     def test_linear_extrude_default_twist_slices_keep_adapter(self) -> None:
         generated = self.translate(
             "linear_extrude(height=10, twist=90, slices=0) square(2);"
@@ -1256,6 +1526,87 @@ class TranslatorTests(unittest.TestCase):
         exec(generated, namespace)
         self.assertEqual(namespace["_parts"][0].bounding_box(), (1, 2, 3, 4))
 
+    def test_translate_infers_dimensions_through_children_modules(self) -> None:
+        generated = self.translate("""
+            module repeated(count) {
+                for (i = [0:count-1]) translate([i*10, 0, 0]) children();
+            }
+            module pick(i) children(i);
+            module pair() children([0:1]);
+            translate([1, 2, 3]) repeated(2) cylinder(h=1, r=1);
+            translate([1, 2, 3]) pick(1) { cube(1); sphere(1); }
+            translate([1, 2, 3]) pair() { cube(1); cube(2); }
+            """)
+
+        self.assertEqual(generated.count("_scadtopy_translate("), 2)
+        self.assertIn("_scadtopy_translate(_scadtopy_children(_children)", generated)
+        self.assertIn(").translate([1.0, 2.0, 3.0])", generated)
+        namespace: dict[str, object] = {}
+        exec(generated, namespace)
+        self.assertEqual(len(namespace["_parts"]), 3)
+        self.assertTrue(
+            all(len(part.bounding_box()) == 6 for part in namespace["_parts"])
+        )
+        reused = namespace["repeated"](2, _children=[namespace["square"](2)])
+        self.assertEqual(reused.bounding_box(), (0, 0, 12, 2))
+
+    def test_translate_children_modules_support_2d_and_3d_callers(self) -> None:
+        generated = self.translate("""
+            module repeated() {
+                for (i = [0:1]) translate([i*10, 0, 0]) children();
+            }
+            module wrapped() repeated() children();
+            translate([1, 2, 3]) repeated() square(2);
+            translate([1, 2, 3]) repeated() cube(2);
+            translate([1, 2, 3]) wrapped() square(2);
+            """)
+
+        self.assertEqual(generated.count("_scadtopy_translate("), 2)
+        self.assertIn(".translate([1.0, 2.0])", generated)
+        self.assertIn(".translate([1.0, 2.0, 3.0])", generated)
+        namespace: dict[str, object] = {}
+        exec(generated, namespace)
+        self.assertEqual(namespace["_parts"][0].bounding_box(), (1, 2, 13, 4))
+        self.assertEqual(namespace["_parts"][1].bounding_box(), (1, 2, 3, 13, 4, 5))
+        self.assertEqual(namespace["_parts"][2].bounding_box(), (1, 2, 13, 4))
+
+    def test_translate_children_with_mixed_dimensions_uses_adapter(self) -> None:
+        generated = self.translate("""
+            module pick(i) children(i);
+            translate([1, 2, 3]) pick(0) { square(2); cube(2); }
+            translate([1, 2, 3]) pick(1) { square(2); cube(2); }
+            """)
+
+        self.assertIn("_scadtopy_translate(pick(", generated)
+        namespace: dict[str, object] = {}
+        exec(generated, namespace)
+        self.assertEqual(namespace["_parts"][0].bounding_box(), (1, 2, 3, 4))
+        self.assertEqual(namespace["_parts"][1].bounding_box(), (1, 2, 3, 3, 4, 5))
+
+    def test_used_children_module_accepts_a_different_dimension(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "layout.scad").write_text(
+                "module repeated() translate([10,0,0]) children(); "
+                "repeated() cube(2);",
+                encoding="utf-8",
+            )
+            (root / "main.scad").write_text(
+                "use <layout.scad>\ntranslate([1,2,3]) repeated() square(2);",
+                encoding="utf-8",
+            )
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                layout = translate_file(root / "layout.scad")
+                main = translate_file(root / "main.scad")
+
+        module = types.ModuleType("layout")
+        with patch.dict(sys.modules, {"layout": module}):
+            exec(layout, module.__dict__)
+            namespace: dict[str, object] = {}
+            exec(main, namespace)
+        self.assertEqual(namespace["_parts"][0].bounding_box(), (11, 2, 13, 4))
+
     def test_translate_infers_import_dimensions(self) -> None:
         from piecad import cube, square
 
@@ -1338,6 +1689,55 @@ class TranslatorTests(unittest.TestCase):
             namespace: dict[str, object] = {}
             exec(main, namespace)
         self.assertEqual(namespace["_parts"][0].bounding_box(), (0, 0, 0, 5, 5, 5))
+
+    def test_used_module_receives_callers_segment_defaults(self) -> None:
+        from piecad import sphere
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "lib.scad").write_text("module part() sphere(2);", encoding="utf-8")
+            (root / "main.scad").write_text(
+                "use <lib.scad>\n$fn=24; part();", encoding="utf-8"
+            )
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                library = translate_file(root / "lib.scad")
+                main = translate_file(root / "main.scad")
+
+        self.assertIn("part(_scadtopy_special_fn=_scadtopy_default_fn", main)
+        module = types.ModuleType("lib")
+        with (
+            patch.dict(sys.modules, {"lib": module}),
+            patch("piecad.sphere", wraps=sphere) as calls,
+        ):
+            exec(library, module.__dict__)
+            exec(main, {})
+        self.assertEqual(calls.call_args.kwargs["segments"], 24)
+
+    def test_used_module_name_collision_keeps_callers_segment_defaults(self) -> None:
+        from piecad import sphere
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "lib.scad").write_text("module part() sphere(2);", encoding="utf-8")
+            (root / "main.scad").write_text(
+                "module part() sphere(1);\nuse <lib.scad>\n$fn=24; part();",
+                encoding="utf-8",
+            )
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                library = translate_file(root / "lib.scad")
+                main = translate_file(root / "main.scad")
+
+        self.assertIn("part(_scadtopy_special_fn=_scadtopy_default_fn", main)
+        module = types.ModuleType("lib")
+        with (
+            patch.dict(sys.modules, {"lib": module}),
+            patch("piecad.sphere", wraps=sphere) as calls,
+        ):
+            exec(library, module.__dict__)
+            exec(main, {})
+        self.assertEqual(calls.call_args.kwargs["segments"], 24)
 
     def test_warns_about_use_and_import_paths_with_source_filename(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1424,15 +1824,12 @@ class TranslatorTests(unittest.TestCase):
 
         self.assertIn(
             "_parts.append(union(cube(1.0), sphere(1.0, "
-            "segments=_scadtopy_calculate_segments(1.0, _scadtopy_default_fn, "
-            "_scadtopy_default_fa, _scadtopy_default_fs))))",
+            "segments=_scadtopy_calculate_segments(1.0))))",
             generated,
         )
         self.assertIn("_parts.append(cube(2.0))", generated)
         self.assertIn(
-            "_parts.append(sphere(2.0, segments=_scadtopy_calculate_segments("
-            "2.0, _scadtopy_default_fn, _scadtopy_default_fa, "
-            "_scadtopy_default_fs)))",
+            "_parts.append(sphere(2.0, segments=_scadtopy_calculate_segments(" "2.0)))",
             generated,
         )
         self.assertNotIn("5.0", generated)
@@ -1538,8 +1935,7 @@ class TranslatorTests(unittest.TestCase):
 
         self.assertIn(
             "cube(1.0).minkowski_sum(sphere(1.0, "
-            "segments=_scadtopy_calculate_segments(1.0, _scadtopy_default_fn, "
-            "_scadtopy_default_fa, _scadtopy_default_fs)))",
+            "segments=_scadtopy_calculate_segments(1.0)))",
             generated,
         )
         compile(generated, "<generated-minkowski>", "exec")

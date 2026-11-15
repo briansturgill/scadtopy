@@ -25,6 +25,8 @@ The translator handles assignments, function and module definitions, expressions
 
 Generated `translate()` calls use Piecad's `.translate()` directly when the geometry dimension is known. Otherwise, an adapter inspects the object at runtime: `Obj2d` receives only the x/y offsets, while `Obj3d` receives all three offsets. Automatic saving selects `.svg` or `.3mf` from the runtime geometry types, so user modules returning 2D or 3D objects are handled correctly.
 
+Dimension inference follows known children through user modules at each call site. Modules that translate their own children still use the adapter when their callers may supply either 2D or 3D geometry.
+
 `multmatrix(m)` maps 3D child geometry to Piecad's `Obj3d.transform()` using the first three rows of `m`; this supports OpenSCAD's 3x4 matrix form and its 4x4 form, whose final row is ignored.
 
 `resize(newsize, auto)` uses a generated adapter for Piecad's 2D and 3D `resize()` methods. Zero dimensions are left unchanged unless selected by `auto`; automatically sized dimensions use the scale of the largest requested dimension. Short vectors are padded with zero sizes or false auto flags, and `convexity` is ignored.
@@ -41,7 +43,11 @@ Translation emits source-filename and line-number warnings for `use <file.scad>`
 
 Correction to the overview above: top-level `$fn`, `$fa`, and `$fs` assignments set the translated segment settings without changing Piecad's global configuration. `$fn` defaults to OpenSCAD's `0`, so segment counts are calculated from the radius, `$fa`, and `$fs` unless overridden. Per-call overrides are passed through, including through user modules. `linear_extrude()` forwards these settings to its child profile and uses them to determine the twist divisions when `slices` is omitted.
 
+Segment calculations and the transformed-extrusion adapter read current default settings at call time; generated calls omit default arguments when they can do so without changing evaluation order.
+
 User modules receive only the segment settings needed by their bodies or the modules they call.
+
+Calls to local modules omit inherited global settings when safe; calls to modules imported via `use` pass the caller's settings explicitly.
 
 Transformed `linear_extrude()` calls use `extrude_transforming()` directly when their arguments can be adapted statically; other cases use a generated runtime adapter.
 

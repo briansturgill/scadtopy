@@ -312,6 +312,20 @@ def _children_modules(nodes: Iterable[object]) -> set[str]:
     return names
 
 
+def _modules_with_nested_defaults(nodes: Iterable[object]) -> set[str]:
+    names: set[str] = set()
+    for node in nodes:
+        if isinstance(node, ModuleDeclaration):
+            if any(
+                isinstance(child, (FunctionDeclaration, ModuleDeclaration))
+                and any(parameter.default is not None for parameter in child.parameters)
+                for child in node.children
+            ):
+                names.add(node.name.name)
+            names |= _modules_with_nested_defaults(node.children)
+    return names
+
+
 _SEGMENT_VARIABLES = ("$fn", "$fa", "$fs")
 
 
@@ -539,6 +553,11 @@ class _Translator:
         self.uses_vec2 = False
         self.helpers: set[str] = set()
         self.module_names: set[str] = set()
+        self.local_module_names: set[str] = set()
+        self.modules_with_nested_defaults: set[str] = set()
+        self.imported_identifiers: set[str] = set()
+        self.unknown_imports = False
+        self.user_identifiers: set[str] = set()
         self.segment_modules: dict[str, set[str]] = {}
         self.geometry_modules: dict[str, ModuleDeclaration] = {}
         self.shadowing_names: set[str] = set()
@@ -549,6 +568,7 @@ class _Translator:
         self.uses_translate_helper = False
         self.uses_resize_helper = False
         self.uses_segments_helper = False
+        self.segment_unset = "_scadtopy_unset"
         self.uses_math = False
         self.segment_overrides: tuple[str, str, str] | None = None
         self.in_module = False
@@ -578,6 +598,12 @@ class _Translator:
         self.assert_counter = 0
         self.expression_bindings = []
         identifiers = _identifier_names(nodes)
+        self.user_identifiers = identifiers
+        self.imported_identifiers = set()
+        self.unknown_imports = False
+        self.segment_unset = "_scadtopy_unset"
+        while self.segment_unset in identifiers:
+            self.segment_unset += "_"
         self.echo_print = "print"
         if "print" in identifiers:
             self.echo_print = "_scadtopy_print"
@@ -596,7 +622,9 @@ class _Translator:
         self.function_names = {
             node.name.name for node in nodes if isinstance(node, FunctionDeclaration)
         }
-        self.module_names = _all_module_names(nodes)
+        self.local_module_names = _all_module_names(nodes)
+        self.modules_with_nested_defaults = _modules_with_nested_defaults(nodes)
+        self.module_names = set(self.local_module_names)
         self.children_modules = _children_modules(nodes)
         declarations = [node for node in nodes if isinstance(node, ModuleDeclaration)]
         nested_names = set().union(
@@ -607,7 +635,6 @@ class _Translator:
             for node in declarations
             if node.name.name not in nested_names
             and sum(other.name.name == node.name.name for other in declarations) == 1
-            and not _uses_children(node.children)
         }
         if any(isinstance(node, UseStatement) for node in nodes):
             self.geometry_modules.clear()
@@ -785,9 +812,17 @@ class _Translator:
         prefix += "\n"
         if self.assert_definitions:
             prefix += "\n\n".join(self.assert_definitions) + "\n\n"
+        segment_defaults = "".join(
+            f"    if {name} is {self.segment_unset}:\n"
+            f"        {name} = _scadtopy_default_{name}\n"
+            for name in ("fn", "fa", "fs")
+        )
         if self.uses_segments_helper or self.uses_linear_extrude_helper:
             prefix += (
-                "def _scadtopy_calculate_segments(radius, fn, fa, fs):\n"
+                f"{self.segment_unset} = object()\n\n"
+                f"def _scadtopy_calculate_segments(radius, fn={self.segment_unset}, "
+                f"fa={self.segment_unset}, fs={self.segment_unset}):\n"
+                f"{segment_defaults}"
                 "    if fn > 0:\n"
                 "        return max(fn, 3)\n"
                 "    return Config.calculate_default_segments(radius, fa, fs)\n\n"
@@ -871,7 +906,9 @@ class _Translator:
             )
         if self.uses_linear_extrude_helper:
             prefix += (
-                "def _scadtopy_linear_extrude(obj, height, center, twist, slices, scale, fn, fa, fs):\n"
+                "def _scadtopy_linear_extrude(obj, height, center, twist, slices, scale, "
+                f"fn={self.segment_unset}, fa={self.segment_unset}, fs={self.segment_unset}):\n"
+                f"{segment_defaults}"
                 "    if not isinstance(scale, (list, tuple)):\n"
                 "        scale = (scale, scale)\n"
                 "    bounds = obj.bounding_box()\n"
@@ -1010,6 +1047,10 @@ class _Translator:
 
     def load_used_names(self, node: UseStatement) -> None:
         nodes = self.used_nodes(node)
+        self.imported_identifiers |= _identifier_names(nodes) | _PIECAD_EXPORTS
+        self.imported_identifiers.update({"math", "random", "Vec2"})
+        if not nodes or any(isinstance(item, UseStatement) for item in nodes):
+            self.unknown_imports = True
         self.module_names |= _all_module_names(nodes)
         self.children_modules |= _children_modules(nodes)
         self.function_names |= {
@@ -1566,12 +1607,16 @@ class _Translator:
                 return direct
             self.uses_linear_extrude_helper = True
             self.uses_math = True
-            fn, fa, fs = self.segment_settings(node.arguments)
-            return (
-                f"_scadtopy_linear_extrude({self.combine(children)}, {height}, "
-                f"{center or 'False'}, {twist or '0'}, {slices or 'None'}, "
-                f"{scale or '1'}, {fn}, {fa}, {fs})"
-            )
+            arguments = [
+                self.combine(children),
+                height,
+                center or "False",
+                twist or "0",
+                slices or "None",
+                scale or "1",
+                *self.segment_arguments(self.segment_settings(node.arguments)),
+            ]
+            return f"_scadtopy_linear_extrude({', '.join(arguments)})"
 
         if name == "rotate_extrude":
             self.reject_unexpected_named_arguments(
@@ -1793,8 +1838,11 @@ class _Translator:
                 return "_scadtopy_children(_children)"
             return f"_scadtopy_children(_children, {self.expression(index)})"
         if name in self.module_names:
-            arguments = self.module_call_arguments(name, node.arguments)
-            if children and name in self.children_modules:
+            passes_children = bool(children and name in self.children_modules)
+            arguments = self.module_call_arguments(
+                name, node.arguments, passes_children
+            )
+            if passes_children:
                 arguments.append(f"_children=[{', '.join(children)}]")
             return f"{self.py_name(name)}({', '.join(arguments)})"
         if children:
@@ -2148,9 +2196,40 @@ class _Translator:
         radius: str,
         positional_fn_index: int = -1,
     ) -> str:
-        fn, fa, fs = self.segment_settings(node.arguments, positional_fn_index)
+        settings = self.segment_settings(node.arguments, positional_fn_index)
         self.uses_segments_helper = True
-        return f"_scadtopy_calculate_segments({radius}, {fn}, {fa}, {fs})"
+        arguments = [radius, *self.segment_arguments(settings)]
+        return f"_scadtopy_calculate_segments({', '.join(arguments)})"
+
+    def segment_arguments(self, settings: tuple[str, str, str]) -> list[str]:
+        defaults = tuple(f"_scadtopy_default_{name}" for name in ("fn", "fa", "fs"))
+
+        def may_have_side_effects(expression: str) -> bool:
+            parsed = ast.parse(expression, mode="eval").body
+            if isinstance(parsed, (ast.Name, ast.Constant)):
+                return False
+            try:
+                ast.literal_eval(parsed)
+            except (ValueError, TypeError):
+                return True
+            return False
+
+        # Preserve default reads before later arguments with possible side effects.
+        keep = [
+            value != defaults[index]
+            or any(
+                later != defaults[later_index] and may_have_side_effects(later)
+                for later_index, later in enumerate(settings[index + 1 :], index + 1)
+            )
+            for index, value in enumerate(settings)
+        ]
+        if all(keep):
+            return list(settings)
+        return [
+            f"{name}={value}"
+            for name, value, include in zip(("fn", "fa", "fs"), settings, keep)
+            if include
+        ]
 
     def segment_tokens(self) -> tuple[str, str, str]:
         if self.segment_overrides:
@@ -2183,7 +2262,7 @@ class _Translator:
         )
 
     def module_call_arguments(
-        self, module_name: str, arguments: list[object]
+        self, module_name: str, arguments: list[object], passes_children: bool
     ) -> list[str]:
         special_names = {
             "$fn": "_scadtopy_special_fn",
@@ -2222,10 +2301,24 @@ class _Translator:
             "$fa": current_fa,
             "$fs": current_fs,
         }
+        local = (
+            module_name in self.local_module_names
+            and module_name not in self.imported_identifiers
+            and self.py_name(module_name) not in self.imported_identifiers
+            and not self.unknown_imports
+            and not passes_children
+            and module_name not in self.modules_with_nested_defaults
+        )
         rendered.extend(
             f"{special_names[name]}={value}"
             for name, value in inherited.items()
-            if name in needed and name not in provided
+            if name in needed
+            and name not in provided
+            and not (
+                local
+                and value == f"_scadtopy_default_{name[1:]}"
+                and value not in self.user_identifiers
+            )
         )
         return rendered
 
@@ -2293,7 +2386,10 @@ class _Translator:
         )
 
     def geometry_dimension(
-        self, nodes: object, active_modules: frozenset[str] = frozenset()
+        self,
+        nodes: object,
+        active_modules: frozenset[str] = frozenset(),
+        children_dimension: int | None = None,
     ) -> int | None:
         if isinstance(nodes, (list, tuple)):
             children = [
@@ -2308,24 +2404,39 @@ class _Translator:
             if not children:
                 return None
             dimensions = {
-                self.geometry_dimension(child, active_modules) for child in children
+                self.geometry_dimension(child, active_modules, children_dimension)
+                for child in children
             }
             return dimensions.pop() if len(dimensions) == 1 else None
         if isinstance(nodes, (ModularModifierHighlight, ModularModifierBackground)):
-            return self.geometry_dimension(nodes.child, active_modules)
+            return self.geometry_dimension(
+                nodes.child, active_modules, children_dimension
+            )
         if isinstance(nodes, (ModularFor, ModularIntersectionFor)):
-            return self.geometry_dimension(nodes.body, active_modules)
+            return self.geometry_dimension(
+                nodes.body, active_modules, children_dimension
+            )
         if isinstance(nodes, ModularIfElse):
-            first = self.geometry_dimension(nodes.true_branch, active_modules)
-            second = self.geometry_dimension(nodes.false_branch, active_modules)
+            first = self.geometry_dimension(
+                nodes.true_branch, active_modules, children_dimension
+            )
+            second = self.geometry_dimension(
+                nodes.false_branch, active_modules, children_dimension
+            )
             return first if first == second else None
         if isinstance(nodes, ModularIf):
-            return self.geometry_dimension(nodes.true_branch, active_modules)
+            return self.geometry_dimension(
+                nodes.true_branch, active_modules, children_dimension
+            )
         if isinstance(nodes, (ModularLet, ModularAssert, ModularEcho)):
-            return self.geometry_dimension(nodes.children, active_modules)
+            return self.geometry_dimension(
+                nodes.children, active_modules, children_dimension
+            )
         if not isinstance(nodes, ModularCall):
             return None
         name = nodes.name.name
+        if name == "children":
+            return children_dimension
         if name == "import":
             file_node = self.argument_expression(nodes.arguments, ("file",), 0)
             if isinstance(file_node, StringLiteral):
@@ -2360,11 +2471,16 @@ class _Translator:
             "intersection",
             "hull",
         }:
-            return self.geometry_dimension(nodes.children, active_modules)
+            return self.geometry_dimension(
+                nodes.children, active_modules, children_dimension
+            )
         declaration = self.geometry_modules.get(name)
         if declaration is not None and name not in active_modules:
+            child_dimension = self.geometry_dimension(
+                nodes.children, active_modules, children_dimension
+            )
             return self.geometry_dimension(
-                declaration.children, active_modules | {name}
+                declaration.children, active_modules | {name}, child_dimension
             )
         return None
 
