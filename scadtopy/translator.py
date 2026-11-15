@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import builtins
 import keyword
 import math
 import re
@@ -220,7 +221,7 @@ def _node_name(node: object) -> str:
 
 
 def _uses_children(node: object) -> bool:
-    if isinstance(node, ModularCall) and node.name.name == "children":
+    if isinstance(node, ModularCall) and node.name.name in {"child", "children"}:
         return True
     if isinstance(node, Identifier) and node.name == "$children":
         return True
@@ -1582,6 +1583,12 @@ class _Translator:
         return f"{operation}(*[{value} {clauses}])"
 
     def module_call(self, node: object) -> str:
+        if (
+            isinstance(node, ModularCall)
+            and node.name.name == "assign"
+            and node.name.name not in self.module_names
+        ):
+            return _tidy(self.assign_module(node))
         if isinstance(node, ModularCall) and any(
             isinstance(child, Assignment) for child in self.module_list(node.children)
         ):
@@ -1621,6 +1628,98 @@ class _Translator:
             arguments = ", ".join(outer_names + [f"*{block}"])
             return f"{name}_apply({arguments})"
         return _tidy(self._module_call(node))
+
+    def assign_module(self, node: ModularCall) -> str:
+        for argument in node.arguments:
+            if not isinstance(argument, (NamedArgument, PositionalArgument)):
+                self.note_unsupported(argument, "assign() argument is not translated")
+                return "None"
+            if isinstance(argument, NamedArgument):
+                name = argument.name.name
+                if name.startswith("$") and name not in _SEGMENT_VARIABLES:
+                    self.note_unsupported(
+                        argument, f"assign() binding {name} is not translated"
+                    )
+                    return "None"
+                if not name.startswith("$") and (
+                    not name.isidentifier() or keyword.iskeyword(name) or name == "PI"
+                ):
+                    self.note_unsupported(
+                        argument, f"assign() binding {name} is not translated"
+                    )
+                    return "None"
+            unsupported = _unsupported_special_variables(argument.expr)
+            if unsupported:
+                self.note_unsupported(
+                    argument, f"{', '.join(sorted(unsupported))} are not translated"
+                )
+                return "None"
+
+        self.module_scope_counter += 1
+        prefix = f"_scadtopy_assign_{self.module_scope_counter}"
+        reserved = self.user_identifiers | self.imported_identifiers
+        while any(f"{prefix}_{i}" in reserved for i in range(len(node.arguments))):
+            prefix += "_"
+        last = {
+            argument.name.name: index
+            for index, argument in enumerate(node.arguments)
+            if isinstance(argument, NamedArgument)
+        }
+        parameters = []
+        values = []
+        settings = list(self.segment_tokens())
+        bound = []
+        for index, argument in enumerate(node.arguments):
+            name = argument.name.name if isinstance(argument, NamedArgument) else None
+            parameter = f"{prefix}_{index}"
+            if name is not None and last[name] == index:
+                if name in _SEGMENT_VARIABLES:
+                    settings[_SEGMENT_VARIABLES.index(name)] = parameter
+                else:
+                    parameter = name
+                bound.append(parameter)
+            value = self.expression(argument.expr)
+            if name == "$fn" and last[name] == index:
+                value = f"int({value})"
+            parameters.append(parameter)
+            values.append(value)
+
+        previous_overrides = self.segment_overrides
+        self.segment_overrides = tuple(settings)
+        definitions_start = len(self.expression_definitions)
+        try:
+            with self.bind_expression_names(bound):
+                body = self.module_group(node.children)
+        finally:
+            self.segment_overrides = previous_overrides
+
+        possible_collisions = set(bound) & (_PIECAD_EXPORTS | set(dir(builtins)))
+        if possible_collisions:
+            generated = "\n".join(
+                [*self.expression_definitions[definitions_start:], body]
+            )
+            references = ast.parse(generated)
+            collisions = {
+                call.func.id
+                for call in ast.walk(references)
+                if isinstance(call, ast.Call)
+                and isinstance(call.func, ast.Name)
+                and call.func.id in possible_collisions
+            }
+            collisions.update(
+                attribute.value.id
+                for attribute in ast.walk(references)
+                if isinstance(attribute, ast.Attribute)
+                and isinstance(attribute.value, ast.Name)
+                and attribute.value.id in possible_collisions
+            )
+            if collisions:
+                self.note_unsupported(
+                    node,
+                    f"assign() bindings shadow generated calls: {', '.join(sorted(collisions))}",
+                )
+                return "None"
+        return f"(lambda {', '.join(parameters)}: {body})({', '.join(values)})"
 
     def _module_call(
         self, node: object, children_override: list[str] | None = None
@@ -2041,14 +2140,15 @@ class _Translator:
                 return f"polygon([[point for point in reversed({points})]])"
             raise TranslationError(f"polygon() requires points{_position(node)}")
 
-        if name == "children":
+        if name == "children" or (name == "child" and name not in self.module_names):
             self.uses_children_helper = True
-            if not node.arguments:
-                return "_scadtopy_children(_children)"
             index = self.argument_expression(node.arguments, ("index",), 0)
-            if index is None:
-                return "_scadtopy_children(_children)"
-            return f"_scadtopy_children(_children, {self.expression(index)})"
+            child_list = "_children" if self.in_module or name == "children" else "()"
+            if index is not None:
+                return f"_scadtopy_children({child_list}, {self.expression(index)})"
+            if name == "child":
+                return f"_scadtopy_children({child_list}, 0)"
+            return f"_scadtopy_children({child_list})"
         if name in self.module_names:
             passes_children = bool(children and name in self.children_modules)
             arguments = self.module_call_arguments(
@@ -2647,8 +2747,12 @@ class _Translator:
         if not isinstance(nodes, ModularCall):
             return None
         name = nodes.name.name
-        if name == "children":
+        if name == "children" or (name == "child" and name not in self.module_names):
             return children_dimension
+        if name == "assign" and name not in self.module_names:
+            return self.geometry_dimension(
+                nodes.children, active_modules, children_dimension
+            )
         if name == "import":
             file_node = self.argument_expression(nodes.arguments, ("file",), 0)
             if isinstance(file_node, StringLiteral):

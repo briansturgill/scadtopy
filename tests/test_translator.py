@@ -1289,6 +1289,91 @@ class TranslatorTests(unittest.TestCase):
         self.assertIn("if True else", generated)
         self.assertIn("lambda size:", generated)
 
+    def test_assign_bindings_are_independent_and_scoped(self) -> None:
+        generated = self.translate("""
+            x = 10;
+            assign(x=2, y=x) {
+                cube([x, y, 1]);
+                translate([x, 0, 0]) cube(1);
+            }
+            cube(x);
+            """)
+        self.assertNotIn("FIXME", generated)
+        namespace: dict[str, object] = {}
+        exec(generated, namespace)
+        self.assertEqual(namespace["_parts"][0].bounding_box(), (0, 0, 0, 3, 10, 1))
+        self.assertEqual(namespace["_parts"][1].bounding_box(), (0, 0, 0, 10, 10, 10))
+
+    def test_assign_nested_blocks_and_segment_bindings(self) -> None:
+        generated = self.translate("""
+            module wrapper() {
+                assign($fn=$fn+2, size=$fn) {
+                    size = size + 1;
+                    cube(size);
+                    children();
+                }
+            }
+            wrapper($fn=4) sphere(1, $fn=4);
+            """)
+        self.assertNotIn("FIXME", generated)
+        namespace: dict[str, object] = {}
+        exec(generated, namespace)
+        self.assertEqual(namespace["_parts"][0].bounding_box(), (-1, -1, -1, 5, 5, 5))
+
+    def test_assign_segment_overrides_and_dimension_inference(self) -> None:
+        from piecad import sphere
+
+        generated = self.translate("""
+            module part() assign($fn=$fn+2) sphere(1);
+            part($fn=4);
+            translate([1, 2, 3]) assign(size=2) square(size);
+            """)
+        namespace: dict[str, object] = {}
+        with patch("piecad.sphere", wraps=sphere) as sphere_call:
+            exec(generated, namespace)
+        self.assertEqual(sphere_call.call_args.kwargs["segments"], 6)
+        self.assertEqual(namespace["_parts"][1].bounding_box(), (1, 2, 3, 4))
+
+    def test_assign_duplicate_and_positional_arguments_are_evaluated(self) -> None:
+        generated = self.translate("""
+            assign(x=echo("first") 2, echo("ignored") 3, x=echo("last") 4)
+                cube(x);
+            """)
+        output = io.StringIO()
+        namespace: dict[str, object] = {}
+        with redirect_stdout(output):
+            exec(generated, namespace)
+        self.assertEqual(output.getvalue(), "first\nignored\nlast\n")
+        self.assertEqual(namespace["_parts"][0].bounding_box(), (0, 0, 0, 4, 4, 4))
+
+    def test_user_defined_assign_overrides_builtin(self) -> None:
+        generated = self.translate("module assign(x) cube(x); assign(3);")
+        namespace: dict[str, object] = {}
+        exec(generated, namespace)
+        self.assertEqual(namespace["_parts"][0].bounding_box(), (0, 0, 0, 3, 3, 3))
+
+    def test_assign_reports_unsupported_special_bindings(self) -> None:
+        with self.assertWarnsRegex(
+            UserWarning, r"UNSUPPORTED: assign\(\) binding \$custom"
+        ):
+            generated = self.translate("assign($custom=2) cube(1);")
+        self.assertIn(
+            "UNSUPPORTED: assign() binding $custom is not translated", generated
+        )
+        compile(generated, "<generated-assign>", "exec")
+
+    def test_assign_reports_bindings_that_shadow_geometry_calls(self) -> None:
+        with self.assertWarnsRegex(UserWarning, "assign\\(\\) bindings shadow"):
+            generated = self.translate("assign(cube=2) cube(cube);")
+        self.assertIn(
+            "UNSUPPORTED: assign() bindings shadow generated calls: cube", generated
+        )
+        compile(generated, "<generated-assign>", "exec")
+        generated = self.translate("assign(cube=2) sphere(cube);")
+        namespace: dict[str, object] = {}
+        exec(generated, namespace)
+        self.assertIsNotNone(namespace["_parts"][0])
+
     def test_translates_remaining_module_nodes_and_render_expression(self) -> None:
         generated = self.translate("""
             rendered = render() { cube(1); };
@@ -1925,6 +2010,40 @@ class TranslatorTests(unittest.TestCase):
         self.assertEqual(namespace["_parts"][0].bounding_box(), (1, 2, 13, 4))
         self.assertEqual(namespace["_parts"][1].bounding_box(), (1, 2, 3, 13, 4, 5))
         self.assertEqual(namespace["_parts"][2].bounding_box(), (1, 2, 13, 4))
+
+    def test_deprecated_child_selects_one_child(self) -> None:
+        generated = self.translate("""
+            module first() child();
+            module pick(index) child(index);
+            module wrapped() first() child();
+            first() { cube(1); cube(2); }
+            pick(1) { cube(1); cube(2); }
+            translate([1, 2, 3]) first() square(2);
+            translate([1, 2, 3]) wrapped() square(2);
+            """)
+        self.assertNotIn("module 'child' has no Piecad mapping", generated)
+        namespace: dict[str, object] = {}
+        exec(generated, namespace)
+        self.assertEqual(namespace["_parts"][0].bounding_box(), (0, 0, 0, 1, 1, 1))
+        self.assertEqual(namespace["_parts"][1].bounding_box(), (0, 0, 0, 2, 2, 2))
+        self.assertEqual(namespace["_parts"][2].bounding_box(), (1, 2, 3, 4))
+        self.assertEqual(namespace["_parts"][3].bounding_box(), (1, 2, 3, 4))
+
+    def test_child_without_enclosing_module_warns(self) -> None:
+        generated = self.translate("child();")
+        namespace: dict[str, object] = {}
+        with self.assertWarnsRegex(UserWarning, "children\\(0\\) is out of range"):
+            exec(generated, namespace)
+        self.assertEqual(namespace["_parts"], [None])
+
+    def test_user_defined_child_overrides_builtin(self) -> None:
+        generated = self.translate("""
+            module child() square(2);
+            translate([1, 2, 3]) child();
+            """)
+        namespace: dict[str, object] = {}
+        exec(generated, namespace)
+        self.assertEqual(namespace["_parts"][0].bounding_box(), (1, 2, 3, 4))
 
     def test_translate_children_with_mixed_dimensions_uses_adapter(self) -> None:
         generated = self.translate("""

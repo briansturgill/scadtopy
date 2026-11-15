@@ -27,6 +27,10 @@ Generated `translate()` calls use Piecad's `.translate()` directly when the geom
 
 Dimension inference follows known children through user modules at each call site. Modules that translate their own children still use the adapter when their callers may supply either 2D or 3D geometry.
 
+The deprecated OpenSCAD `child()` selects the first child, while `child(i)` selects child `i`.
+
+The deprecated `assign()` scopes its bindings over its child geometry. Its binding expressions are evaluated independently in the enclosing scope, unlike `let()`. Bindings that shadow generated Python or Piecad calls are reported as unsupported.
+
 `multmatrix(m)` maps 3D child geometry to Piecad's `Obj3d.transform()` using the first three rows of `m`; this supports OpenSCAD's 3x4 matrix form and its 4x4 form, whose final row is ignored.
 
 `resize(newsize, auto)` uses a generated adapter for Piecad's 2D and 3D `resize()` methods. Zero dimensions are left unchanged unless selected by `auto`; automatically sized dimensions use the scale of the largest requested dimension. Short vectors are padded with zero sizes or false auto flags, and `convexity` is ignored.
