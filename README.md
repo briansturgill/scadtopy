@@ -35,8 +35,10 @@ OpenSCAD ranges use Piecad `frange`, with inclusive endpoints and list results.
 
 OpenSCAD assertions translate to Python `assert` statements, which are disabled when Python runs with `-O` or `-OO`.
 
+OpenSCAD `echo()` translates to Python `print()`, so output uses Python's formatting rather than OpenSCAD's console format.
+
 Translation emits source-filename and line-number warnings for `use <file.scad>` (the used file must be translated separately) and supported `import("file")` paths (passed unchanged to Piecad and resolved from the Python process working directory).
 
-Correction to the overview above: top-level `$fn`, `$fa`, and `$fs` assignments map to Piecad's segment-count, minimum-angle, and minimum-segment-length configuration. Circular primitives calculate their segment count from the radius and active settings; per-call overrides are passed through, including through user modules. `linear_extrude()` forwards these settings to its child profile and uses them to determine the twist divisions when `slices` is omitted.
+Correction to the overview above: top-level `$fn`, `$fa`, and `$fs` assignments set the translated segment settings without changing Piecad's global configuration. `$fn` defaults to OpenSCAD's `0`, so segment counts are calculated from the radius, `$fa`, and `$fs` unless overridden. Per-call overrides are passed through, including through user modules. `linear_extrude()` forwards these settings to its child profile and uses them to determine the twist divisions when `slices` is omitted.
 
 When a top-level function or module is called before its declaration, declarations from that source point onward are emitted before the first forward call, matching OpenSCAD's order-independent declaration behavior. Statements before that call, including assignments used by module parameter defaults, retain their order.

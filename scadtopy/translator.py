@@ -259,6 +259,22 @@ def _called_names(node: object) -> set[str]:
     return names
 
 
+def _identifier_names(node: object) -> set[str]:
+    if isinstance(node, Identifier):
+        return {node.name}
+    if isinstance(node, (list, tuple)):
+        return set().union(*(_identifier_names(item) for item in node))
+    if hasattr(node, "__dict__"):
+        return set().union(
+            *(
+                _identifier_names(value)
+                for key, value in vars(node).items()
+                if key != "position"
+            )
+        )
+    return set()
+
+
 def _unwrap_commented_names(node: object) -> None:
     """Replace comment-wrapped identifiers in `name` slots with the identifier."""
     if isinstance(node, (list, tuple)):
@@ -351,7 +367,8 @@ class _Translator:
         self.assert_definitions: list[str] = []
         self.assert_counter = 0
         self.expression_bindings: list[str] = []
-        self.uses_echo_helper = False
+        self.echo_print = "print"
+        self.uses_echo_print_alias = False
         self.fixmes: list[str] = []
 
     def py_name(self, name: str) -> str:
@@ -372,7 +389,13 @@ class _Translator:
         self.assert_definitions = []
         self.assert_counter = 0
         self.expression_bindings = []
-        self.uses_echo_helper = False
+        identifiers = _identifier_names(nodes)
+        self.echo_print = "print"
+        if "print" in identifiers:
+            self.echo_print = "_scadtopy_print"
+            while self.echo_print in identifiers:
+                self.echo_print += "_"
+        self.uses_echo_print_alias = False
         self.fixmes = []
         self.uses_children_helper = False
         self.uses_linear_extrude_helper = False
@@ -414,7 +437,7 @@ class _Translator:
                     hoisted_declarations.extend(self.function_declaration(node))
         statements: list[str] = [
             "_parts = []",
-            "_scadtopy_default_fn = Config.get_default_segments()",
+            "_scadtopy_default_fn = 0",
             "_scadtopy_default_fa = Config.get_default_min_angle()",
             "_scadtopy_default_fs = Config.get_default_min_segment_length()",
         ]
@@ -435,8 +458,10 @@ class _Translator:
                     )
                     last_statement_is_model = False
                     continue
-                assertions, expression = self.assertions_before_expression(node.expr)
-                statements.extend(assertions)
+                prefix_statements, expression = self.statements_before_expression(
+                    node.expr
+                )
+                statements.extend(prefix_statements)
                 value = self.expression(expression)
                 if node.name.name == "$fn":
                     statements.append(f"_scadtopy_default_fn = int({value})")
@@ -469,12 +494,16 @@ class _Translator:
                 if isinstance(node, ModularModifierDisable):
                     self.module_call(node)
                     last_statement_is_model = False
-                elif isinstance(node, ModularEcho) and not node.children:
-                    statements.append(self.module_call(node))
-                    last_statement_is_model = False
-                elif isinstance(node, ModularAssert) and not node.children:
-                    statements.append(self.assert_statement(node))
-                    last_statement_is_model = False
+                elif isinstance(node, (ModularEcho, ModularAssert)):
+                    prefix_statements, model = self.module_with_statements(node)
+                    statements.extend(prefix_statements)
+                    if model != "None":
+                        saw_model = True
+                        statements.append(f"_parts.append({model})")
+                        part_count += 1
+                        last_statement_is_model = True
+                    else:
+                        last_statement_is_model = False
                 else:
                     saw_model = True
                     model = self.module_call(node)
@@ -538,35 +567,12 @@ class _Translator:
         statements.extend(self.fixmes)
         body = "\n".join(statements).rstrip()
         prefix = ""
+        if self.uses_echo_print_alias:
+            prefix = f"from builtins import print as {self.echo_print}\n\n"
         if self.uses_math or "round" in self.helpers:
-            prefix = "import math\n\n"
+            prefix += "import math\n\n"
         if "rands" in self.helpers:
             prefix += "import random\n\n"
-        if self.uses_echo_helper:
-            prefix += (
-                "import json\n\n"
-                "def _scadtopy_echo_repr(value):\n"
-                "    if value is True:\n"
-                "        return 'true'\n"
-                "    if value is False:\n"
-                "        return 'false'\n"
-                "    if value is None:\n"
-                "        return 'undef'\n"
-                "    if isinstance(value, str):\n"
-                "        return json.dumps(value, ensure_ascii=False)\n"
-                "    if isinstance(value, (list, tuple)):\n"
-                "        return '[' + ', '.join(_scadtopy_echo_repr(item) for item in value) + ']'\n"
-                "    if isinstance(value, float) and value.is_integer():\n"
-                "        return str(int(value))\n"
-                "    return str(value)\n\n"
-                "def _scadtopy_echo(values, result):\n"
-                "    rendered = []\n"
-                "    for name, value in values:\n"
-                "        text = _scadtopy_echo_repr(value)\n"
-                "        rendered.append(f'{name} = {text}' if name is not None else text)\n"
-                "    print('ECHO: ' + ', '.join(rendered))\n"
-                "    return result()\n\n"
-            )
         for helper in sorted(self.helpers):
             prefix += _BUILTIN_HELPERS[helper] + "\n\n"
         prefix += "from piecad import *\n"
@@ -884,8 +890,12 @@ class _Translator:
                         "are not translated"
                     )
                     continue
-                assertions, expression = self.assertions_before_expression(child.expr)
-                assignments.extend(f"    {assertion}" for assertion in assertions)
+                prefix_statements, expression = self.statements_before_expression(
+                    child.expr
+                )
+                assignments.extend(
+                    f"    {statement}" for statement in prefix_statements
+                )
                 value = self.expression(expression)
                 if child.name.name == "$fn":
                     assignments.append(f"    _scadtopy_special_fn = int({value})")
@@ -899,9 +909,7 @@ class _Translator:
                     )
                 else:
                     assignments.append(f"    {child.name.name} = {value}")
-            elif isinstance(child, ModularEcho) and not child.children:
-                assignments.append(f"    {self.module_call(child)}")
-            elif isinstance(child, ModularAssert) and not child.children:
+            elif isinstance(child, (ModularEcho, ModularAssert)):
                 unsupported = _unsupported_special_variables(child)
                 if unsupported:
                     assignments.append(
@@ -909,7 +917,10 @@ class _Translator:
                         "are not translated"
                     )
                     continue
-                geometry.append((True, self.assert_statement(child)))
+                prefix_statements, translated = self.module_with_statements(child)
+                geometry.extend((True, statement) for statement in prefix_statements)
+                if translated != "None":
+                    geometry.append((False, translated))
             elif isinstance(child, ModuleInstantiation):
                 unsupported = _unsupported_special_variables(child)
                 if unsupported:
@@ -974,7 +985,21 @@ class _Translator:
         params = self.parameters(node.parameters)
         enclosing_assert_definitions = self.assert_definitions
         self.assert_definitions = []
-        assertions, expression = self.assertions_before_expression(node.expr)
+        expression = node.expr
+        prefix_statements: list[str] = []
+        if isinstance(expression, LetOp) and isinstance(
+            expression.body, (AssertOp, EchoOp)
+        ):
+            names = {assignment.name.name for assignment in expression.assignments}
+            values = [assignment.expr for assignment in expression.assignments]
+            if not names & _identifier_names(values):
+                prefix_statements.extend(
+                    f"{assignment.name.name} = {self.expression(assignment.expr)}"
+                    for assignment in expression.assignments
+                )
+                expression = expression.body
+        statements, expression = self.statements_before_expression(expression)
+        prefix_statements.extend(statements)
         value = self.expression(expression)
         definitions = self.assert_definitions
         self.assert_definitions = enclosing_assert_definitions
@@ -985,7 +1010,7 @@ class _Translator:
                 for definition in definitions
                 for line in definition.splitlines()
             ),
-            *(f"    {assertion}" for assertion in assertions),
+            *(f"    {statement}" for statement in prefix_statements),
             f"    return {value}",
         ]
 
@@ -1041,12 +1066,15 @@ class _Translator:
         condition, message = self.assert_values(node.arguments, node)
         return f"assert {condition}, {message}"
 
-    def assertions_before_expression(self, node: object) -> tuple[list[str], object]:
-        assertions = []
-        while isinstance(node, AssertOp):
-            assertions.append(self.assert_statement(node))
+    def statements_before_expression(self, node: object) -> tuple[list[str], object]:
+        statements = []
+        while isinstance(node, (AssertOp, EchoOp)):
+            if isinstance(node, AssertOp):
+                statements.append(self.assert_statement(node))
+            else:
+                statements.append(self.echo_statement(node.arguments))
             node = node.body
-        return assertions, node
+        return statements, node
 
     @contextmanager
     def bind_expression_names(self, names: Iterable[str]) -> Iterator[None]:
@@ -1062,31 +1090,59 @@ class _Translator:
         name = f"_scadtopy_assert_{self.assert_counter}"
         bindings = list(dict.fromkeys(self.expression_bindings))
         condition, message = self.assert_values(node.arguments, node)
-        value = (
-            self.expression(node.body)
-            if isinstance(node, AssertOp)
-            else self.module_group(node.children)
-        )
+        if isinstance(node, AssertOp):
+            statements, expression = self.statements_before_expression(node.body)
+            value = self.expression(expression)
+        else:
+            children = self.module_list(node.children)
+            if len(children) == 1:
+                statements, value = self.module_with_statements(children[0])
+            else:
+                statements, value = [], self.module_group(children)
+        body = "".join(f"    {statement}\n" for statement in statements)
         self.assert_definitions.append(
             f"def {name}({', '.join(bindings)}):\n"
             f"    assert {condition}, {message}\n"
+            f"{body}"
             f"    return {value}"
         )
         return f"{name}({', '.join(bindings)})"
 
-    def echo_expression(self, arguments: list[object], result: str) -> str:
-        self.uses_echo_helper = True
+    def echo_statement(self, arguments: list[object]) -> str:
+        if self.echo_print != "print":
+            self.uses_echo_print_alias = True
         values = []
         for argument in arguments:
             if isinstance(argument, PositionalArgument):
-                values.append(f"(None, {self.expression(argument.expr)})")
+                values.append(self.expression(argument.expr))
             elif isinstance(argument, NamedArgument):
-                values.append(
-                    f"({argument.name.name!r}, {self.expression(argument.expr)})"
+                values.extend(
+                    (repr(f"{argument.name.name} ="), self.expression(argument.expr))
                 )
             else:
                 self.note_fixme(argument, "unknown echo argument is not translated")
-        return f"_scadtopy_echo([{', '.join(values)}], lambda: {result})"
+        return f"{self.echo_print}({', '.join(values)})"
+
+    def echo_expression(self, arguments: list[object], result: str) -> str:
+        return f"({self.echo_statement(arguments)}, {result})[1]"
+
+    def module_with_statements(self, node: object) -> tuple[list[str], str]:
+        statements = []
+        while isinstance(node, (ModularAssert, ModularEcho)):
+            statements.append(
+                self.assert_statement(node)
+                if isinstance(node, ModularAssert)
+                else self.echo_statement(node.arguments)
+            )
+            children = [
+                child
+                for child in self.module_list(node.children)
+                if not isinstance(child, (CommentLine, CommentSpan, BlankLine))
+            ]
+            if len(children) != 1:
+                return statements, self.module_group(children)
+            node = children[0]
+        return statements, self.module_call(node)
 
     def module_list(self, nodes: object) -> list[object]:
         if isinstance(nodes, list):
@@ -1102,7 +1158,7 @@ class _Translator:
             if isinstance(node, ModularModifierDisable):
                 self.module_call(node)
                 continue
-            if isinstance(node, ModularAssert) and not node.children:
+            if isinstance(node, (ModularAssert, ModularEcho)) and not node.children:
                 assertions.append(self.module_call(node))
                 continue
             geometry = self.module_call(node)

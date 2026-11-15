@@ -98,6 +98,26 @@ class TranslatorTests(unittest.TestCase):
         compile(cylinder, "<generated-cylinder>", "exec")
         compile(tapered, "<generated-tapered-cylinder>", "exec")
 
+    def test_default_fn_uses_openscad_auto_segments(self) -> None:
+        from piecad import Config, sphere
+
+        generated = self.translate(
+            "observed = $fn; $fa = 6; $fs = 1; sphere(5);"
+            "module shape() { sphere(5); } shape();"
+        )
+        namespace: dict[str, object] = {}
+        with (
+            patch.object(Config, "get_default_segments", return_value=100),
+            patch("piecad.sphere", wraps=sphere) as sphere_call,
+        ):
+            exec(generated, namespace)
+
+        self.assertEqual(namespace["observed"], 0)
+        self.assertEqual(
+            [call.kwargs["segments"] for call in sphere_call.call_args_list],
+            [32, 32],
+        )
+
     def test_top_level_fn_sets_default_segments_global(self) -> None:
         generated = self.translate("$fn = 48; sphere(5);")
 
@@ -321,7 +341,7 @@ class TranslatorTests(unittest.TestCase):
         namespace: dict[str, object] = {}
         with redirect_stdout(output):
             exec(generated, namespace)
-        self.assertEqual(output.getvalue(), "ECHO: 0\nECHO: 6\nECHO: 2\n")
+        self.assertEqual(output.getvalue(), "0.0\n6.0\n2.0\n")
         self.assertEqual(namespace["values"], [0, 2, 4, 6])
 
     def test_translates_functions_let_assert_and_function_literals(self) -> None:
@@ -386,6 +406,10 @@ class TranslatorTests(unittest.TestCase):
         self.assertNotIn("def _scadtopy_assert(", generated)
         self.assertIn("assert True, 'top'", generated)
         self.assertIn("assert True, 'module'", generated)
+        self.assertIn(
+            "def checked(x):\n    y = x + 1.0\n    assert y > 0.0, 'bad'\n    return y",
+            generated,
+        )
         self.assertIn("def direct(x):\n    assert x > 0.0, 'direct'", generated)
         namespace: dict[str, object] = {}
         exec(generated, namespace)
@@ -399,6 +423,16 @@ class TranslatorTests(unittest.TestCase):
         with self.assertRaises(AssertionError):
             namespace["callback"](0)
         self.assertEqual(namespace["_parts"][0].bounding_box(), (0, 0, 0, 2, 2, 2))
+
+    def test_function_let_assertion_preserves_outer_initializer_scope(self) -> None:
+        generated = self.translate("""
+            y = 4;
+            function checked() = let(y = y + 1) assert(y > 0) y;
+            result = checked();
+            """)
+        namespace: dict[str, object] = {}
+        exec(generated, namespace)
+        self.assertEqual(namespace["result"], 5)
 
     def test_assertions_only_evaluate_selected_branches_and_failure_messages(
         self,
@@ -459,6 +493,19 @@ class TranslatorTests(unittest.TestCase):
         with self.assertRaises(AssertionError):
             namespace["check"](9)
 
+    def test_nested_assertion_chain_uses_one_function(self) -> None:
+        generated = self.translate("""
+            values = [for (x = [1, 2]) assert(x > 0) assert(x < 3) echo(x) x];
+            """)
+        self.assertEqual(generated.count("def _scadtopy_assert_"), 1)
+        self.assertIn("    print(x)\n    return x", generated)
+        output = io.StringIO()
+        namespace: dict[str, object] = {}
+        with redirect_stdout(output):
+            exec(generated, namespace)
+        self.assertEqual(namespace["values"], [1, 2])
+        self.assertEqual(output.getvalue(), "1.0\n2.0\n")
+
     def test_module_assertion_with_unsupported_special_variable_is_reported(
         self,
     ) -> None:
@@ -474,8 +521,81 @@ class TranslatorTests(unittest.TestCase):
         with redirect_stdout(output):
             exec(generated, namespace)
 
-        self.assertEqual(output.getvalue(), 'ECHO: "number", 3, status = true\n')
+        self.assertIn("print('number', 3.0, 'status =', True)", generated)
+        self.assertNotIn("_scadtopy_echo", generated)
+        self.assertEqual(output.getvalue(), "number 3.0 status = True\n")
         self.assertEqual(namespace["result"], 7.0)
+
+    def test_echo_and_assert_chains_become_statements(self) -> None:
+        generated = self.translate("""
+            function checked(x) = echo("first", x) assert(x > 0) echo("last") x;
+            result = checked(2);
+            echo("outer") assert(true) cube(1);
+            """)
+        self.assertIn("    print('first', x)\n    assert x > 0.0", generated)
+        self.assertIn("    print('last')\n    return x", generated)
+        self.assertIn("print('outer')\nassert True", generated)
+        self.assertNotIn("_scadtopy_assert_", generated)
+        self.assertNotIn("_scadtopy_echo", generated)
+        output = io.StringIO()
+        namespace: dict[str, object] = {}
+        with redirect_stdout(output):
+            exec(generated, namespace)
+        self.assertEqual(output.getvalue(), "first 2.0\nlast\nouter\n")
+        self.assertEqual(namespace["result"], 2)
+
+    def test_nested_echo_preserves_lazy_branches_and_iteration(self) -> None:
+        generated = self.translate("""
+            values = [for (x = [1, 2]) echo(x) x * 2];
+            skipped = true ? 3 : echo("wrong") 4;
+            callback = function(x) echo(x) x + 1;
+            """)
+        self.assertNotIn("_scadtopy_echo", generated)
+        output = io.StringIO()
+        namespace: dict[str, object] = {}
+        with redirect_stdout(output):
+            exec(generated, namespace)
+            self.assertEqual(namespace["callback"](5), 6)
+        self.assertEqual(output.getvalue(), "1.0\n2.0\n5\n")
+        self.assertEqual(namespace["values"], [2, 4])
+        self.assertEqual(namespace["skipped"], 3)
+
+    def test_echo_uses_builtin_print_when_user_shadows_it(self) -> None:
+        generated = self.translate("""
+            function print(x) = x + 1;
+            values = [for (print = [1, 2]) echo(print) print];
+            result = print(3);
+            """)
+        output = io.StringIO()
+        namespace: dict[str, object] = {}
+        with redirect_stdout(output):
+            exec(generated, namespace)
+        self.assertEqual(output.getvalue(), "1.0\n2.0\n")
+        self.assertEqual(namespace["values"], [1, 2])
+        self.assertEqual(namespace["result"], 4)
+
+    def test_module_echo_runs_between_geometry_calls(self) -> None:
+        from piecad import cube
+
+        generated = self.translate("""
+            module shape() { cube(1); echo("middle"); cube(2); }
+            shape();
+            """)
+        events = []
+
+        def track_cube(size: float) -> object:
+            events.append(f"cube {size}")
+            return cube(size)
+
+        with (
+            patch("piecad.cube", side_effect=track_cube),
+            patch(
+                "builtins.print",
+                side_effect=lambda *args: events.append(" ".join(args)),
+            ),
+        ):
+            exec(generated, {})
+        self.assertEqual(events, ["cube 1.0", "middle", "cube 2.0"])
 
     def test_translates_list_comprehension_loops_and_conditions(self) -> None:
         generated = self.translate("""
@@ -555,7 +675,7 @@ class TranslatorTests(unittest.TestCase):
         with redirect_stdout(output):
             exec(generated, namespace)
         self.assertIsNotNone(namespace["_parts"][0])
-        self.assertEqual(output.getvalue(), "ECHO: 1\n")
+        self.assertEqual(output.getvalue(), "1.0\n")
 
     def test_module_echo_prints_arguments_and_returns_child_geometry(self) -> None:
         generated = self.translate('echo("shape", count=2) cube(1);')
@@ -565,7 +685,7 @@ class TranslatorTests(unittest.TestCase):
         with redirect_stdout(output):
             exec(generated, namespace)
 
-        self.assertEqual(output.getvalue(), 'ECHO: "shape", count = 2\n')
+        self.assertEqual(output.getvalue(), "shape count = 2.0\n")
         self.assertEqual(namespace["_parts"][0].bounding_box(), (0, 0, 0, 1, 1, 1))
 
     def test_standalone_module_echo_does_not_create_a_model(self) -> None:
@@ -576,7 +696,7 @@ class TranslatorTests(unittest.TestCase):
         with redirect_stdout(output):
             exec(generated, namespace)
 
-        self.assertEqual(output.getvalue(), 'ECHO: "standalone"\n')
+        self.assertEqual(output.getvalue(), "standalone\n")
         self.assertEqual(namespace["_parts"], [])
 
     def test_translates_polyhedron_faces_for_piecad(self) -> None:
@@ -639,7 +759,7 @@ class TranslatorTests(unittest.TestCase):
         finally:
             Config.set_default_segments(original_segments)
 
-        self.assertIn('ECHO: "done"', output.getvalue())
+        self.assertIn("done", output.getvalue())
 
     def test_translates_children_and_unions_module_bodies(self) -> None:
         generated = self.translate("""
