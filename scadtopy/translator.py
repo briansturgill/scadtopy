@@ -276,6 +276,20 @@ def _identifier_names(node: object) -> set[str]:
     return set()
 
 
+def _contains_function_literal(node: object) -> bool:
+    if isinstance(node, FunctionLiteral):
+        return True
+    if isinstance(node, (list, tuple)):
+        return any(_contains_function_literal(item) for item in node)
+    if hasattr(node, "__dict__"):
+        return any(
+            _contains_function_literal(value)
+            for key, value in vars(node).items()
+            if key != "position"
+        )
+    return False
+
+
 def _unwrap_commented_names(node: object) -> None:
     """Replace comment-wrapped identifiers in `name` slots with the identifier."""
     if isinstance(node, (list, tuple)):
@@ -1233,12 +1247,15 @@ class _Translator:
         self.assert_definitions = []
         expression = node.expr
         prefix_statements: list[str] = []
-        if isinstance(expression, LetOp) and isinstance(
-            expression.body, (AssertOp, EchoOp)
-        ):
+        if isinstance(expression, LetOp):
             names = {assignment.name.name for assignment in expression.assignments}
-            values = [assignment.expr for assignment in expression.assignments]
-            if not names & _identifier_names(values):
+            assigned: set[str] = set()
+            safe = len(names) == len(expression.assignments)
+            for assignment in expression.assignments:
+                if (names - assigned) & _identifier_names(assignment.expr):
+                    safe = False
+                assigned.add(assignment.name.name)
+            if safe:
                 prefix_statements.extend(
                     f"{assignment.name.name} = {self.expression(assignment.expr)}"
                     for assignment in expression.assignments
@@ -2501,30 +2518,79 @@ class _Translator:
 
     def list_comprehension(self, node: ListComprehension) -> str:
         elements = [
-            self.vector_segment(element)
+            element
             for element in node.elements
             if not isinstance(element, (CommentLine, CommentSpan, BlankLine))
         ]
         if not elements:
             return "[]"
-        if all(
-            not isinstance(
-                element,
-                (
-                    ListCompCFor,
-                    ListCompEach,
-                    ListCompFor,
-                    ListCompIf,
-                    ListCompIfElse,
-                    ListCompLet,
-                ),
+        controls = (ListCompCFor, ListCompFor, ListCompIf, ListCompIfElse)
+        if len(elements) == 1 and isinstance(elements[0], ListCompEach):
+            element = elements[0]
+            value = self.vector_element_value(element.body)
+            if isinstance(element.body, ListComprehension):
+                return value
+            return f"[] + ({value})"
+        if any(
+            isinstance(element, ListCompLet)
+            or (
+                isinstance(element, ListCompEach)
+                and not isinstance(element.body, ListComprehension)
             )
-            for element in node.elements
+            for element in elements
         ):
-            return (
-                f"[{', '.join(self.expression(element) for element in node.elements)}]"
+            segments = [self.vector_segment(element) for element in elements]
+            return f"sum([{', '.join(segments)}], [])"
+        if len(elements) == 1 and isinstance(elements[0], controls):
+            return self.vector_segment(elements[0])
+        values = [
+            (
+                f"*{self.vector_segment(element)}"
+                if isinstance(element, controls)
+                else (
+                    f"*{self.expression(element.body)}"
+                    if isinstance(element, ListCompEach)
+                    else self.expression(element)
+                )
             )
-        return f"sum([{', '.join(elements)}], [])"
+            for element in elements
+        ]
+        return f"[{', '.join(values)}]"
+
+    def comprehension_let_is_safe(
+        self, element: LetOp | ListCompLet, clauses: list[str]
+    ) -> bool:
+        if not clauses or _contains_function_literal(element):
+            return False
+        names = {assignment.name.name for assignment in element.assignments}
+        try:
+            comprehension = ast.parse(f"[None {' '.join(clauses)}]", mode="eval").body
+        except SyntaxError:
+            return False
+        assert isinstance(comprehension, ast.ListComp)
+        bound: set[str] = set()
+        for index, generator in enumerate(comprehension.generators):
+            if index and any(
+                isinstance(node, ast.Name) and node.id in names - bound
+                for node in ast.walk(generator.iter)
+            ):
+                return False
+            bound.update(
+                node.id
+                for node in ast.walk(generator.target)
+                if isinstance(node, ast.Name)
+            )
+            for condition in generator.ifs:
+                if any(
+                    isinstance(node, ast.Name) and node.id in names - bound
+                    for node in ast.walk(condition)
+                ):
+                    return False
+        for assignment in element.assignments:
+            if (names - bound) & _identifier_names(assignment.expr):
+                return False
+            bound.add(assignment.name.name)
+        return True
 
     def vector_segment(self, element: object, clauses: list[str] | None = None) -> str:
         clauses = list(clauses or [])
@@ -2533,7 +2599,7 @@ class _Translator:
             for assignment in element.assignments:
                 with self.bind_expression_names(names):
                     clauses.append(
-                        f"for {assignment.name.name} in {self.expression(assignment.expr)}"
+                        f"for {assignment.name.name} in ({self.expression(assignment.expr)})"
                     )
                 names.append(assignment.name.name)
             with self.bind_expression_names(names):
@@ -2541,7 +2607,7 @@ class _Translator:
         if isinstance(element, ListCompIf):
             if not any(clause.startswith("for ") for clause in clauses):
                 clauses.insert(0, "for _ in [None]")
-            clauses.append(f"if {self.expression(element.condition)}")
+            clauses.append(f"if ({self.expression(element.condition)})")
             return self.vector_segment(element.true_expr, clauses)
         if isinstance(element, ListCompIfElse):
             value = (
@@ -2550,6 +2616,18 @@ class _Translator:
                 f"{self.vector_element_value(element.false_expr)})"
             )
             return f"[{value} {' '.join(clauses)}]".rstrip()
+        if isinstance(element, (LetOp, ListCompLet)) and self.comprehension_let_is_safe(
+            element, clauses
+        ):
+            names = []
+            for assignment in element.assignments:
+                with self.bind_expression_names(names):
+                    clauses.append(
+                        f"for {assignment.name.name} in [{self.expression(assignment.expr)}]"
+                    )
+                names.append(assignment.name.name)
+            with self.bind_expression_names(names):
+                return self.vector_segment(element.body, clauses)
         if isinstance(element, ListCompLet):
             with self.bind_expression_names(a.name.name for a in element.assignments):
                 value = self.vector_segment(element.body, clauses)

@@ -33,6 +33,8 @@ Dimension inference follows known children through user modules at each call sit
 
 Function values can be called through expressions, including functions selected from lists, returned by other calls, or chosen conditionally.
 
+Function-level `let` bindings become assignments when this preserves their scope. Common list comprehensions use Python comprehensions and list unpacking; scoped lambda expressions remain where needed to preserve shadowing or closure behavior.
+
 OpenSCAD ranges use Piecad `frange`, with inclusive endpoints and list results.
 
 OpenSCAD assertions translate to Python `assert` statements, which are disabled when Python runs with `-O` or `-OO`.

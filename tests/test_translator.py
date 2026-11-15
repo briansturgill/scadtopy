@@ -712,6 +712,47 @@ class TranslatorTests(unittest.TestCase):
         exec(generated, namespace)
         self.assertEqual(namespace["result"], 5)
 
+    def test_function_let_uses_assignments_for_sequential_bindings(self) -> None:
+        generated = self.translate("""
+            function calculate(x) = let(a=x+1, b=a*2) a+b;
+            result = calculate(3);
+            """)
+        self.assertIn(
+            "def calculate(x):\n    a = x + 1.0\n    b = a * 2.0\n    return a + b",
+            generated,
+        )
+        self.assertNotIn("lambda", generated)
+        namespace: dict[str, object] = {}
+        exec(generated, namespace)
+        self.assertEqual(namespace["result"], 12)
+
+    def test_function_let_initializers_run_once_in_order(self) -> None:
+        generated = self.translate("""
+            function value(x) = echo(x) x;
+            function calculate() = let(a=value(1), b=value(a+1)) b;
+            result = calculate();
+            """)
+        output = io.StringIO()
+        namespace: dict[str, object] = {}
+        with redirect_stdout(output):
+            exec(generated, namespace)
+        self.assertEqual(output.getvalue(), "1.0\n2.0\n")
+        self.assertEqual(namespace["result"], 2)
+
+    def test_function_let_keeps_outer_scope_when_shadowing(self) -> None:
+        generated = self.translate("""
+            value = 5;
+            function calculate() = let(value=value+1) value*2;
+            function capture() = let(callback=function() value, value=6) callback();
+            result = calculate();
+            captured = capture();
+            """)
+        namespace: dict[str, object] = {}
+        exec(generated, namespace)
+        self.assertEqual(namespace["result"], 12)
+        self.assertEqual(namespace["captured"], 5)
+        self.assertEqual(namespace["value"], 5)
+
     def test_assertions_only_evaluate_selected_branches_and_failure_messages(
         self,
     ) -> None:
@@ -888,12 +929,68 @@ class TranslatorTests(unittest.TestCase):
         self.assertEqual(namespace["even"], [0.0, 2.0, 4.0])
         self.assertEqual(namespace["selected"], [3.0])
 
+    def test_comprehensions_use_plain_python_and_preserve_order(self) -> None:
+        generated = self.translate("""
+            function value(x) = echo(x) x;
+            values = [value(0), for (i=[1,2]) value(i), value(3)];
+            pairs = [for (x=[1,2]) for (y=[3,4]) [x,y]];
+            """)
+        self.assertNotIn("sum([", generated)
+        self.assertIn("[[x, y] for x in [1.0, 2.0] for y in [3.0, 4.0]]", generated)
+        output = io.StringIO()
+        namespace: dict[str, object] = {}
+        with redirect_stdout(output):
+            exec(generated, namespace)
+        self.assertEqual(output.getvalue(), "0.0\n1.0\n2.0\n3.0\n")
+        self.assertEqual(namespace["values"], [0, 1, 2, 3])
+        self.assertEqual(namespace["pairs"], [[1, 3], [1, 4], [2, 3], [2, 4]])
+
+    def test_comprehension_let_is_evaluated_per_iteration(self) -> None:
+        generated = self.translate("""
+            offset = 10;
+            values = [for (i=[1,2]) let(x=i+offset, y=x+1) x+y];
+            shadowed = [for (i=[1,2]) let(i=i+1) i];
+            conditional = [for (i=true ? [1,2] : []) let(x=i+1) x];
+            filtered = [for (i=[1,2]) if (true ? i>1 : false) let(x=i+1) x];
+            """)
+        self.assertNotIn("lambda", generated)
+        self.assertNotIn("sum([", generated)
+        namespace: dict[str, object] = {}
+        exec(generated, namespace)
+        self.assertEqual(namespace["values"], [23, 25])
+        self.assertEqual(namespace["shadowed"], [2, 3])
+        self.assertEqual(namespace["conditional"], [2, 3])
+        self.assertEqual(namespace["filtered"], [3])
+
+    def test_comprehension_let_preserves_outer_shadowed_binding(self) -> None:
+        generated = self.translate("""
+            x = 10;
+            values = [for (i=[1,2]) let(x=x+i) x];
+            filtered = [for (i=[1,2]) if (x > 0) let(x=i) x];
+            callbacks = [for (i=[1,2]) let(x=i) function() x];
+            """)
+        namespace: dict[str, object] = {}
+        exec(generated, namespace)
+        self.assertEqual(namespace["values"], [11, 12])
+        self.assertEqual(namespace["filtered"], [1, 2])
+        self.assertEqual([callback() for callback in namespace["callbacks"]], [1, 2])
+        self.assertEqual(namespace["x"], 10)
+
     def test_marks_unmapped_comprehension_and_translates_each(self) -> None:
-        generated = self.translate("flattened = [each [1, 2, 3]];")
+        generated = self.translate("""
+            original = [1, 2, 3];
+            flattened = [each original];
+            selected = [each (true ? original : [4])];
+            mixed = [0, each [1, 2], for (x=[3, 4]) x];
+            """)
 
         namespace: dict[str, object] = {}
         exec(generated, namespace)
+        self.assertNotIn("sum([", generated)
         self.assertEqual(namespace["flattened"], [1.0, 2.0, 3.0])
+        self.assertIsNot(namespace["flattened"], namespace["original"])
+        self.assertEqual(namespace["selected"], [1, 2, 3])
+        self.assertEqual(namespace["mixed"], [0, 1, 2, 3, 4])
 
     def test_marks_c_style_comprehension_node_for_follow_up(self) -> None:
         position = Position("test.scad", 1, 1)
