@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import keyword
 import math
 import re
 import warnings
@@ -12,6 +13,7 @@ from typing import Iterable, Iterator
 
 from openscad_parser.ast import getASTfromFile
 from openscad_parser.ast.nodes import (
+    AdditionOp,
     Assignment,
     AssertOp,
     BlankLine,
@@ -22,6 +24,8 @@ from openscad_parser.ast.nodes import (
     EchoOp,
     FunctionDeclaration,
     FunctionLiteral,
+    GreaterThanOp,
+    GreaterThanOrEqualOp,
     Identifier,
     IncludeStatement,
     ListComprehension,
@@ -32,6 +36,8 @@ from openscad_parser.ast.nodes import (
     ListCompIfElse,
     ListCompLet,
     LetOp,
+    LessThanOp,
+    LessThanOrEqualOp,
     ModularAssert,
     ModularCall,
     ModularEcho,
@@ -55,6 +61,7 @@ from openscad_parser.ast.nodes import (
     RangeLiteral,
     RenderExpression,
     StringLiteral,
+    SubtractionOp,
     UnaryMinusOp,
     UndefinedLiteral,
     UseStatement,
@@ -586,12 +593,15 @@ class _Translator:
         self.uses_math = False
         self.segment_overrides: tuple[str, str, str] | None = None
         self.in_module = False
-        self.assert_definitions: list[str] = []
+        self.expression_definitions: list[str] = []
         self.assert_counter = 0
+        self.c_for_counter = 0
+        self.each_counter = 0
+        self.module_scope_counter = 0
         self.expression_bindings: list[str] = []
         self.echo_print = "print"
         self.uses_echo_print_alias = False
-        self.fixmes: list[str] = []
+        self.diagnostics: list[str] = []
 
     def py_name(self, name: str) -> str:
         return f"{name}_" if name in self.shadowing_names else name
@@ -608,8 +618,11 @@ class _Translator:
         self.uses_math = False
         self.segment_overrides = None
         self.in_module = False
-        self.assert_definitions = []
+        self.expression_definitions = []
         self.assert_counter = 0
+        self.c_for_counter = 0
+        self.each_counter = 0
+        self.module_scope_counter = 0
         self.expression_bindings = []
         identifiers = _identifier_names(nodes)
         self.user_identifiers = identifiers
@@ -624,7 +637,7 @@ class _Translator:
             while self.echo_print in identifiers:
                 self.echo_print += "_"
         self.uses_echo_print_alias = False
-        self.fixmes = []
+        self.diagnostics = []
         self.uses_children_helper = False
         self.uses_linear_extrude_helper = False
         self.uses_text_helper = False
@@ -809,7 +822,7 @@ class _Translator:
                 ]
             )
 
-        statements.extend(self.fixmes)
+        statements.extend(self.diagnostics)
         body = "\n".join(statements).rstrip()
         prefix = ""
         if self.uses_echo_print_alias:
@@ -824,8 +837,8 @@ class _Translator:
         if self.uses_vec2:
             prefix += "from piecad.lin_math import Vec2\n"
         prefix += "\n"
-        if self.assert_definitions:
-            prefix += "\n\n".join(self.assert_definitions) + "\n\n"
+        if self.expression_definitions:
+            prefix += "\n\n".join(self.expression_definitions) + "\n\n"
         segment_defaults = "".join(
             f"    if {name} is {self.segment_unset}:\n"
             f"        {name} = _scadtopy_default_{name}\n"
@@ -1126,8 +1139,8 @@ class _Translator:
         if _uses_children(node.children):
             params.append("_children=()")
         lines = [f"def {self.py_name(node.name.name)}({', '.join(params)}):"]
-        enclosing_assert_definitions = self.assert_definitions
-        self.assert_definitions = []
+        enclosing_expression_definitions = self.expression_definitions
+        self.expression_definitions = []
         assignments: list[str] = []
         for name in _SEGMENT_VARIABLES:
             if name in needed:
@@ -1208,10 +1221,10 @@ class _Translator:
         self.in_module = previous_in_module
         lines[1:1] = [
             f"    {line}"
-            for definition in self.assert_definitions
+            for definition in self.expression_definitions
             for line in definition.splitlines()
         ]
-        self.assert_definitions = enclosing_assert_definitions
+        self.expression_definitions = enclosing_expression_definitions
         if assignments:
             lines.extend(assignments)
         if geometry:
@@ -1243,8 +1256,8 @@ class _Translator:
                 "    return None",
             ]
         params = self.parameters(node.parameters)
-        enclosing_assert_definitions = self.assert_definitions
-        self.assert_definitions = []
+        enclosing_expression_definitions = self.expression_definitions
+        self.expression_definitions = []
         expression = node.expr
         prefix_statements: list[str] = []
         if isinstance(expression, LetOp):
@@ -1264,8 +1277,8 @@ class _Translator:
         statements, expression = self.statements_before_expression(expression)
         prefix_statements.extend(statements)
         value = self.expression(expression)
-        definitions = self.assert_definitions
-        self.assert_definitions = enclosing_assert_definitions
+        definitions = self.expression_definitions
+        self.expression_definitions = enclosing_expression_definitions
         return [
             f"def {self.py_name(node.name.name)}({params}):",
             *(
@@ -1358,12 +1371,12 @@ class _Translator:
             value = self.expression(expression)
         else:
             children = self.module_list(node.children)
-            if len(children) == 1:
+            if len(children) == 1 and not isinstance(children[0], Assignment):
                 statements, value = self.module_with_statements(children[0])
             else:
                 statements, value = [], self.module_group(children)
         body = "".join(f"    {statement}\n" for statement in statements)
-        self.assert_definitions.append(
+        self.expression_definitions.append(
             f"def {name}({', '.join(bindings)}):\n"
             f"    assert {condition}, {message}\n"
             f"{body}"
@@ -1402,7 +1415,7 @@ class _Translator:
                 for child in self.module_list(node.children)
                 if not isinstance(child, (CommentLine, CommentSpan, BlankLine))
             ]
-            if len(children) != 1:
+            if len(children) != 1 or isinstance(children[0], Assignment):
                 return statements, self.module_group(children)
             node = children[0]
         return statements, self.module_call(node)
@@ -1439,10 +1452,118 @@ class _Translator:
         return geometries
 
     def module_group(self, nodes: object) -> str:
+        if any(isinstance(node, Assignment) for node in self.module_list(nodes)):
+            call, _ = self.scoped_module_block(nodes, as_list=False)
+            return call
         geometries = self.module_children(nodes)
         if not geometries:
             return "None"
         return self.combine(geometries)
+
+    def scoped_module_block(self, nodes: object, as_list: bool) -> tuple[str, int]:
+        children = self.module_list(nodes)
+        assignments: dict[str, Assignment] = {}
+        for node in children:
+            if isinstance(node, Assignment):
+                name = node.name.name
+                if name in assignments:
+                    self.warn(
+                        node, f"Duplicate assignment to {name}; using the last value"
+                    )
+                assignments[name] = node
+
+        self.module_scope_counter += 1
+        name = f"_scadtopy_block_{self.module_scope_counter}"
+        reserved = self.user_identifiers | self.imported_identifiers
+        while any(
+            candidate in reserved
+            for candidate in (
+                name,
+                f"{name}_apply",
+                *(f"{name}_outer_{i}" for i in range(len(assignments))),
+                *(f"{name}_child_{i}" for i in range(len(children))),
+                *(f"{name}_{special[1:]}" for special in _SEGMENT_VARIABLES),
+            )
+        ):
+            name += "_"
+
+        ordinary_names = [n for n in assignments if not n.startswith("$")]
+        outer_names = [
+            binding
+            for binding in dict.fromkeys(self.expression_bindings)
+            if binding not in ordinary_names
+        ]
+        needed: set[str] = set()
+        assigned: set[str] = set()
+        for assignment in assignments.values():
+            needed.update(
+                (set(ordinary_names) - assigned) & _identifier_names(assignment.expr)
+            )
+            assigned.add(assignment.name.name)
+        shadow_names = [n for n in ordinary_names if n in needed]
+        getters = [f"{name}_outer_{i}" for i in range(len(shadow_names))]
+        parameters = ", ".join(outer_names + getters)
+        lines = [f"def {name}({parameters}):"]
+        for variable, getter in zip(shadow_names, getters):
+            lines.extend(
+                [
+                    "    try:",
+                    f"        {variable} = {getter}()",
+                    "    except NameError:",
+                    f"        {variable} = None",
+                ]
+            )
+
+        previous_overrides = self.segment_overrides
+        settings = list(self.segment_tokens())
+        bound = list(shadow_names)
+        try:
+            for variable, assignment in assignments.items():
+                unsupported = _unsupported_special_variables(assignment.expr)
+                if unsupported:
+                    self.note_unsupported(
+                        assignment,
+                        f"{', '.join(sorted(unsupported))} are not translated",
+                    )
+                    continue
+                with self.bind_expression_names(bound):
+                    statements, expression = self.statements_before_expression(
+                        assignment.expr
+                    )
+                    value = self.expression(expression)
+                lines.extend(f"    {statement}" for statement in statements)
+                if variable in _SEGMENT_VARIABLES:
+                    index = _SEGMENT_VARIABLES.index(variable)
+                    target = f"{name}_{variable[1:]}"
+                    lines.append(
+                        f"    {target} = {'int(' + value + ')' if variable == '$fn' else value}"
+                    )
+                    settings[index] = target
+                    self.segment_overrides = tuple(settings)
+                    bound.append(target)
+                elif variable.startswith("$"):
+                    self.note_unsupported(assignment, f"{variable} is not translated")
+                else:
+                    lines.append(f"    {variable} = {value}")
+                    if variable not in bound:
+                        bound.append(variable)
+
+            with self.bind_expression_names(bound):
+                geometries = self.module_children(
+                    [child for child in children if not isinstance(child, Assignment)]
+                )
+        finally:
+            self.segment_overrides = previous_overrides
+
+        result = (
+            f"[{', '.join(geometries)}]"
+            if as_list
+            else self.combine(geometries) if geometries else "None"
+        )
+        lines.append(f"    return {result}")
+        self.expression_definitions.append("\n".join(lines))
+        arguments = outer_names + [f"lambda: {variable}" for variable in shadow_names]
+        return f"{name}({', '.join(arguments)})", len(geometries)
 
     def module_loop(
         self, assignments: list[Assignment], body: object, operation: str = "union"
@@ -1461,9 +1582,49 @@ class _Translator:
         return f"{operation}(*[{value} {clauses}])"
 
     def module_call(self, node: object) -> str:
+        if isinstance(node, ModularCall) and any(
+            isinstance(child, Assignment) for child in self.module_list(node.children)
+        ):
+            previous_overrides = self.segment_overrides
+            if node.name.name in {"linear_extrude", "offset", "rotate_extrude"}:
+                self.segment_overrides = self.segment_settings(node.arguments)
+            try:
+                block, count = self.scoped_module_block(node.children, as_list=True)
+            finally:
+                self.segment_overrides = previous_overrides
+            name = block.split("(", 1)[0]
+            children = [f"{name}_child_{i}" for i in range(count)]
+            if count == 1:
+                return _tidy(self._module_call(node, children_override=[f"{block}[0]"]))
+            if count > 1 and node.name.name in _PIECAD_NAMES:
+                self._module_call(node, children_override=children)
+                return f"{_PIECAD_NAMES[node.name.name]}(*{block})"
+            if count > 1 and node.name.name in {
+                *_TRANSFORMS,
+                "resize",
+                "multmatrix",
+                "linear_extrude",
+                "rotate_extrude",
+                "offset",
+                "render",
+                "group",
+            }:
+                return _tidy(
+                    self._module_call(node, children_override=[f"union(*{block})"])
+                )
+            outer_names = list(dict.fromkeys(self.expression_bindings))
+            result = self._module_call(node, children_override=children)
+            self.expression_definitions.append(
+                f"def {name}_apply({', '.join(outer_names + children)}):\n"
+                f"    return {_tidy(result)}"
+            )
+            arguments = ", ".join(outer_names + [f"*{block}"])
+            return f"{name}_apply({arguments})"
         return _tidy(self._module_call(node))
 
-    def _module_call(self, node: object) -> str:
+    def _module_call(
+        self, node: object, children_override: list[str] | None = None
+    ) -> str:
         if isinstance(node, ModularFor):
             return self.module_loop(node.assignments, node.body)
         if isinstance(node, ModularIntersectionFor):
@@ -1500,7 +1661,11 @@ class _Translator:
             return "None"
 
         name = node.name.name
-        if name not in self.module_names and name not in _CENTER_MODULES:
+        if (
+            name not in self.module_names
+            and name not in _CENTER_MODULES
+            and name != "import"
+        ):
             # OpenSCAD silently ignores arguments a built-in doesn't have.
             node.arguments = [
                 argument
@@ -1510,7 +1675,7 @@ class _Translator:
                     and argument.name.name == "center"
                 )
             ]
-        arguments = self.call_arguments(node.arguments)
+        arguments = self.call_arguments(node.arguments) if name != "import" else []
         previous_segment_overrides = self.segment_overrides
         if name in {"linear_extrude", "offset", "rotate_extrude"}:
             self.segment_overrides = self.segment_settings(node.arguments)
@@ -1520,7 +1685,11 @@ class _Translator:
             if not isinstance(child, (CommentLine, CommentSpan, BlankLine))
         ]
         try:
-            children = self.module_children(source_children)
+            children = (
+                self.module_children(source_children)
+                if children_override is None
+                else children_override
+            )
         finally:
             self.segment_overrides = previous_segment_overrides
         if source_children and all(child == "None" for child in children):
@@ -1766,23 +1935,49 @@ class _Translator:
         if name == "import":
             self.reject_children(node, children)
             file_node = self.argument_expression(node.arguments, ("file",), 0)
-            if not isinstance(file_node, StringLiteral):
-                self.note_fixme(node, "import() requires a literal file name")
+            if file_node is None:
+                self.note_fixme(node, "import() requires a file name")
                 return "None"
-            extension = file_node.val.rpartition(".")[2].lower()
-            if extension not in _PIECAD_LOAD_EXTENSIONS:
-                self.note_fixme(
+            unsupported_arguments = {
+                argument.name.name
+                for argument in node.arguments
+                if isinstance(argument, NamedArgument)
+            } - {"file", "convexity"}
+            positional = [
+                argument
+                for argument in node.arguments
+                if isinstance(argument, PositionalArgument)
+            ]
+            if len(positional) > 1:
+                unsupported_arguments.add("positional layer")
+            if unsupported_arguments:
+                self.note_unsupported(
                     node,
-                    f"import() of .{extension} files is not supported by Piecad load()",
+                    f"import() parameter(s) {', '.join(sorted(unsupported_arguments))} "
+                    "are not supported by Piecad load()",
                 )
                 return "None"
+            if isinstance(file_node, StringLiteral):
+                extension = file_node.val.rpartition(".")[2].lower()
+                if extension not in _PIECAD_LOAD_EXTENSIONS:
+                    self.note_fixme(
+                        node,
+                        f"import() of .{extension} files is not supported by Piecad load()",
+                    )
+                    return "None"
+            filename = self.expression(file_node)
+            warning_argument = (
+                f'"{file_node.val}"'
+                if isinstance(file_node, StringLiteral)
+                else filename
+            )
             self.warn(
                 node,
-                f'import("{file_node.val}") is passed to Piecad unchanged and '
+                f"import({warning_argument}) is passed to Piecad unchanged and "
                 "resolves relative to the Python process working directory, "
                 "not the .scad file directory",
             )
-            return f"load({self.expression(file_node)})"
+            return f"load({filename})"
         if name == "polyhedron":
             self.reject_children(node, children)
             points = self.argument_value(node.arguments, ("points",), 0)
@@ -2505,8 +2700,14 @@ class _Translator:
         line = _position(node).removeprefix(" at line ")
         location = f" at line {line}" if line else ""
         fixme = f"pass  # FIXME: {message}{location}"
-        if fixme not in self.fixmes:
-            self.fixmes.append(fixme)
+        if fixme not in self.diagnostics:
+            self.diagnostics.append(fixme)
+
+    def note_unsupported(self, node: object, message: str) -> None:
+        diagnostic = f"# UNSUPPORTED: {message}{_position(node)}"
+        if diagnostic not in self.diagnostics:
+            self.diagnostics.append(diagnostic)
+            self.warn(node, f"UNSUPPORTED: {message}")
 
     def let_expression(self, assignments: list[Assignment], body: str) -> str:
         for index in reversed(range(len(assignments))):
@@ -2592,6 +2793,251 @@ class _Translator:
             bound.add(assignment.name.name)
         return True
 
+    def c_for_segment(self, element: ListCompCFor, clauses: list[str]) -> str:
+        initial_names = list(
+            dict.fromkeys(assignment.name.name for assignment in element.inits)
+        )
+        update_names = [assignment.name.name for assignment in element.incrs]
+        names = initial_names + update_names
+        if any(not name.isidentifier() or keyword.iskeyword(name) for name in names):
+            self.note_unsupported(
+                element, "C-style comprehension with invalid bindings"
+            )
+            return "[]"
+
+        extra_names = set(update_names) - set(initial_names)
+        needed = extra_names & _identifier_names([element.condition, element.body])
+        assigned: set[str] = set()
+        for assignment in element.incrs:
+            needed.update((extra_names - assigned) & _identifier_names(assignment.expr))
+            assigned.add(assignment.name.name)
+        seed_names = list(dict.fromkeys(n for n in update_names if n in needed))
+
+        simple = self.simple_c_for_segment(element, clauses)
+        if simple is not None:
+            return simple
+
+        self.c_for_counter += 1
+        name = f"_scadtopy_c_for_{self.c_for_counter}"
+        reserved = self.user_identifiers | self.imported_identifiers
+        count = len(element.inits) + len(element.incrs)
+        while any(
+            candidate in reserved
+            for candidate in (
+                name,
+                f"{name}_body",
+                f"{name}_count",
+                f"{name}_item",
+                f"{name}_duplicate",
+                *(f"{name}_outer_{index}" for index in range(len(seed_names))),
+                *(f"{name}_update_{index}" for index in range(len(element.incrs))),
+                *(f"{name}_ignored_{index}" for index in range(count)),
+            )
+        ):
+            name += "_"
+        outer_names = [
+            binding
+            for binding in dict.fromkeys(self.expression_bindings)
+            if binding not in names
+        ]
+        state_names = initial_names + seed_names
+        duplicate_name = f"{name}_duplicate"
+        duplicates = len(initial_names) != len(element.inits) or len(
+            set(update_names)
+        ) != len(update_names)
+        if duplicates:
+            self.expression_definitions.append(
+                f"def {duplicate_name}(value, name):\n"
+                "    import warnings\n"
+                "    warnings.warn(f'Ignoring duplicate variable assignment "
+                "{name} = {value!r}', stacklevel=2)"
+            )
+
+        with self.bind_expression_names(state_names):
+            condition = self.expression(element.condition)
+            body = self.vector_segment(element.body)
+            updates = []
+            update_bindings: list[str] = []
+            for index, assignment in enumerate(element.incrs):
+                with self.bind_expression_names(update_bindings):
+                    value = self.expression(assignment.expr)
+                if _contains_function_literal(assignment.expr):
+                    available = list(dict.fromkeys(state_names + update_bindings))
+                    try:
+                        expression = ast.parse(value, mode="eval")
+                    except SyntaxError:
+                        snapshot = available
+                    else:
+                        referenced = {
+                            node.id
+                            for node in ast.walk(expression)
+                            if isinstance(node, ast.Name)
+                        }
+                        snapshot = [
+                            binding for binding in available if binding in referenced
+                        ]
+                    helper = f"{name}_update_{index}"
+                    params = ", ".join(snapshot)
+                    updates.extend(
+                        [
+                            f"        def {helper}({params}):",
+                            f"            return {value}",
+                        ]
+                    )
+                    value = f"{helper}({params})"
+                target = assignment.name.name
+                if target in update_bindings:
+                    updates.append(f"        {duplicate_name}({value}, {target!r})")
+                else:
+                    updates.append(f"        {target} = {value}")
+                    update_bindings.append(target)
+
+        body_name = f"{name}_body"
+        counter_name = f"{name}_count"
+        getter_names = [f"{name}_outer_{index}" for index in range(len(seed_names))]
+        parameters = ", ".join(initial_names + outer_names + getter_names)
+        arguments = ", ".join(
+            initial_names
+            + outer_names
+            + [f"lambda: {binding}" for binding in seed_names]
+        )
+        definition = [
+            f"def {name}({parameters}):",
+        ]
+        for binding, getter in zip(seed_names, getter_names):
+            definition.extend(
+                [
+                    "    try:",
+                    f"        {binding} = {getter}()",
+                    "    except NameError:",
+                    f"        {binding} = None",
+                ]
+            )
+        definition.extend([f"    {counter_name} = 0", f"    while {condition}:"])
+        if _contains_function_literal(element.body):
+            definition.extend(
+                [
+                    f"        def {body_name}({', '.join(state_names)}):",
+                    f"            return {_tidy(body)}",
+                    f"        yield from {body_name}({', '.join(state_names)})",
+                ]
+            )
+        else:
+            definition.append(f"        yield from {_tidy(body)}")
+        definition.extend(
+            [
+                f"        {counter_name} += 1",
+                f"        if {counter_name} > 1000000:",
+                "            raise RuntimeError('OpenSCAD C-style loop limit exceeded')",
+                *updates,
+            ]
+        )
+        self.expression_definitions.append("\n".join(definition))
+        prior_names: set[str] = set()
+        independent = True
+        for assignment in element.inits:
+            if assignment.name.name in prior_names or prior_names & _identifier_names(
+                assignment.expr
+            ):
+                independent = False
+                break
+            prior_names.add(assignment.name.name)
+        if independent:
+            values = [self.expression(assignment.expr) for assignment in element.inits]
+            values.extend(outer_names)
+            values.extend(f"lambda: {binding}" for binding in seed_names)
+            call = f"{name}({', '.join(values)})"
+        else:
+            bindings: list[tuple[str, str]] = []
+            seen: list[str] = []
+            for index, assignment in enumerate(element.inits):
+                with self.bind_expression_names(seen):
+                    value = self.expression(assignment.expr)
+                target = assignment.name.name
+                if target in seen:
+                    value = f"{duplicate_name}({value}, {target!r})"
+                    target = f"{name}_ignored_{index}"
+                else:
+                    seen.append(target)
+                bindings.append((target, value))
+            call = f"{name}({arguments})"
+            for target, value in reversed(bindings):
+                call = f"(lambda {target}: {call})({value})"
+        if clauses:
+            item = f"{name}_item"
+            result = f"[{item} {' '.join(clauses)} for {item} in {call}]"
+        else:
+            result = f"[*{call}]"
+        return result
+
+    def simple_c_for_segment(
+        self, element: ListCompCFor, clauses: list[str]
+    ) -> str | None:
+        if (
+            len(element.inits) != 1
+            or len(element.incrs) != 1
+            or _contains_function_literal(element.body)
+        ):
+            return None
+        initial, update = element.inits[0], element.incrs[0]
+        name = initial.name.name
+        condition = element.condition
+        increment = update.expr
+        if (
+            update.name.name != name
+            or not isinstance(
+                condition,
+                (LessThanOp, LessThanOrEqualOp, GreaterThanOp, GreaterThanOrEqualOp),
+            )
+            or not isinstance(condition.left, Identifier)
+            or condition.left.name != name
+            or not isinstance(increment, (AdditionOp, SubtractionOp))
+            or not isinstance(increment.left, Identifier)
+            or increment.left.name != name
+        ):
+            return None
+        start = _literal_number(initial.expr)
+        stop = _literal_number(condition.right)
+        step = _literal_number(increment.right)
+        if (
+            start is None
+            or stop is None
+            or step is None
+            or not all(
+                float(value).is_integer() and abs(value) <= 2**52
+                for value in (start, stop, step)
+            )
+            or step == 0
+        ):
+            return None
+        if isinstance(increment, SubtractionOp):
+            step = -step
+        ascending = isinstance(condition, (LessThanOp, LessThanOrEqualOp))
+        inclusive = isinstance(condition, (LessThanOrEqualOp, GreaterThanOrEqualOp))
+        if (step > 0) != ascending:
+            return None
+        end = int(stop) + (1 if ascending else -1) if inclusive else int(stop)
+        count = len(range(int(start), end, int(step)))
+        if count > 1000000:
+            return None
+        if inclusive:
+            distance = (stop - start) / step
+            range_count = (
+                math.floor(math.nextafter(distance, math.inf)) + 1
+                if distance >= 0
+                else 0
+            )
+            if range_count != count:
+                return None
+        iterator = f"frange({start!r}, {stop!r}, {step!r}"
+        if inclusive:
+            iterator += ", inclusive=True"
+        iterator += ")"
+        with self.bind_expression_names([name]):
+            return self.vector_segment(
+                element.body, [*clauses, f"for {name} in {iterator}"]
+            )
+
     def vector_segment(self, element: object, clauses: list[str] | None = None) -> str:
         clauses = list(clauses or [])
         if isinstance(element, ListCompFor):
@@ -2606,10 +3052,38 @@ class _Translator:
                 return self.vector_segment(element.body, clauses)
         if isinstance(element, ListCompIf):
             if not any(clause.startswith("for ") for clause in clauses):
-                clauses.insert(0, "for _ in [None]")
+                dummy = "_scadtopy_dummy"
+                while (
+                    dummy in self.user_identifiers or dummy in self.imported_identifiers
+                ):
+                    dummy += "_"
+                clauses.insert(0, f"for {dummy} in [None]")
             clauses.append(f"if ({self.expression(element.condition)})")
             return self.vector_segment(element.true_expr, clauses)
         if isinstance(element, ListCompIfElse):
+            controls = (
+                ListCompEach,
+                ListCompCFor,
+                ListCompFor,
+                ListCompIf,
+                ListCompIfElse,
+                ListCompLet,
+            )
+            if isinstance(element.true_expr, controls) or isinstance(
+                element.false_expr, controls
+            ):
+                condition = self.expression(element.condition)
+                true_value = self.vector_segment(element.true_expr)
+                false_value = self.vector_segment(element.false_expr)
+                value = f"({true_value} if {condition} else {false_value})"
+                if not clauses:
+                    return value
+                item = "_scadtopy_if_item"
+                while (
+                    item in self.user_identifiers or item in self.imported_identifiers
+                ):
+                    item += "_"
+                return f"[{item} {' '.join(clauses)} for {item} in {value}]"
             value = (
                 f"({self.vector_element_value(element.true_expr)} if "
                 f"{self.expression(element.condition)} else "
@@ -2634,20 +3108,39 @@ class _Translator:
             return self.let_expression(element.assignments, value)
         if isinstance(element, ListCompEach):
             value = self.vector_element_value(element.body)
+            self.each_counter += 1
+            name = f"_scadtopy_each_{self.each_counter}"
+            while name in self.user_identifiers or name in self.imported_identifiers:
+                name += "_"
+            self.expression_definitions.append(
+                f"def {name}(value):\n"
+                "    import builtins\n"
+                "    if value is None:\n"
+                "        return []\n"
+                "    if builtins.isinstance(value, (builtins.list, builtins.tuple, "
+                "builtins.str, builtins.range)):\n"
+                "        return [*value]\n"
+                "    return [value]"
+            )
+            value = f"{name}({value})"
             if clauses:
-                self.note_fixme(
-                    element, "each inside a list comprehension is approximated"
-                )
-                return f"[{value} {' '.join(clauses)}]"
+                item = "_scadtopy_each_item"
+                while (
+                    item in self.user_identifiers or item in self.imported_identifiers
+                ):
+                    item += "_"
+                return f"[{item} {' '.join(clauses)} for {item} in ({value})]"
             return value
         if isinstance(element, ListCompCFor):
-            self.note_fixme(element, "C-style list comprehension is not translated")
-            return "[]"
+            return self.c_for_segment(element, clauses)
         value = self.vector_element_value(element)
         return f"[{value} {' '.join(clauses)}]".rstrip()
 
     def vector_element_value(self, element: object) -> str:
-        if isinstance(element, (ListCompFor, ListCompIf, ListCompIfElse, ListCompLet)):
+        if isinstance(
+            element,
+            (ListCompCFor, ListCompFor, ListCompIf, ListCompIfElse, ListCompLet),
+        ):
             segment = self.vector_segment(element)
             self.note_fixme(
                 element, "nested list-comprehension control is approximated"

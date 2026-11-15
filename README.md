@@ -33,15 +33,19 @@ Dimension inference follows known children through user modules at each call sit
 
 Function values can be called through expressions, including functions selected from lists, returned by other calls, or chosen conditionally.
 
-Function-level `let` bindings become assignments when this preserves their scope. Common list comprehensions use Python comprehensions and list unpacking; scoped lambda expressions remain where needed to preserve shadowing or closure behavior.
+Function-level `let` bindings become assignments when this preserves their scope. Common list comprehensions use Python comprehensions and list unpacking; scoped lambda expressions remain where needed to preserve shadowing or closure behavior. C-style comprehensions use `frange` for safe literal integer loops and a scoped generator otherwise. Duplicate bindings evaluate their expressions, produce warnings, and retain the first value. Bindings that cannot be represented as Python identifiers are reported as unsupported.
+
+Assignments inside nested geometry blocks use scoped Python helpers, preserving loop bindings, shadowing, and child order. When a block assigns the same variable more than once, the last expression is evaluated at the first assignment's position, with a warning.
 
 OpenSCAD ranges use Piecad `frange`, with inclusive endpoints and list results.
+
+Geometry `import()` accepts runtime filename expressions and passes them to Piecad `load()`, which determines the format at runtime. Layer selection and other unsupported import options produce warnings and `UNSUPPORTED` comments rather than silently importing different geometry.
 
 OpenSCAD assertions translate to Python `assert` statements, which are disabled when Python runs with `-O` or `-OO`.
 
 OpenSCAD `echo()` translates to Python `print()`, so output uses Python's formatting rather than OpenSCAD's console format.
 
-Translation emits source-filename and line-number warnings for `use <file.scad>` (the used file must be translated separately) and supported `import("file")` paths (passed unchanged to Piecad and resolved from the Python process working directory).
+Translation emits source-filename and line-number warnings for `use <file.scad>` (the used file must be translated separately) and supported `import()` paths (passed unchanged to Piecad and resolved from the Python process working directory).
 
 Correction to the overview above: top-level `$fn`, `$fa`, and `$fs` assignments set the translated segment settings without changing Piecad's global configuration. `$fn` defaults to OpenSCAD's `0`, so segment counts are calculated from the radius, `$fa`, and `$fs` unless overridden. Per-call overrides are passed through, including through user modules. `linear_extrude()` forwards these settings to its child profile and uses them to determine the twist divisions when `slices` is omitted.
 

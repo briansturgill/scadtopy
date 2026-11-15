@@ -10,20 +10,10 @@ from contextlib import redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
-from openscad_parser.ast.builder import Position
-from openscad_parser.ast.nodes import (
-    Assignment,
-    BooleanLiteral,
-    Identifier,
-    ListCompCFor,
-    ListComprehension,
-    NumberLiteral,
-)
 from scadtopy import cli as main_module
 from scadtopy import translate_file
 from scadtopy.translator import TranslationError
 from scadtopy.cli import main
-from scadtopy.translator import _Translator
 
 
 class TranslatorTests(unittest.TestCase):
@@ -780,6 +770,145 @@ class TranslatorTests(unittest.TestCase):
         exec(generated, namespace)
         self.assertEqual(namespace["_parts"][0].bounding_box(), (0, 0, 0, 2, 2, 2))
 
+    def test_nested_block_assignments_preserve_loop_and_outer_scope(self) -> None:
+        generated = self.translate("""
+            module shape() {
+                x = 5;
+                for (i = [1, 2]) {
+                    x = x + i;
+                    y = x * 2;
+                    assert(y > 0) translate([y, 0, 0]) cube(i);
+                }
+                cube(x);
+            }
+            shape();
+            """)
+        self.assertNotIn("FIXME: Assignment", generated)
+        namespace: dict[str, object] = {}
+        exec(generated, namespace)
+        self.assertEqual(namespace["_parts"][0].bounding_box(), (0, 0, 0, 16, 5, 5))
+
+    def test_nested_block_assignments_apply_to_boolean_children(self) -> None:
+        from piecad import difference
+
+        generated = self.translate("""
+            width = 20;
+            translate([width, 0, 0]) {
+                width = 10;
+                difference() {
+                    cut = 4;
+                    cube(width);
+                    translate([2, 2, 2]) cube(cut);
+                }
+            }
+            """)
+        self.assertNotIn("FIXME: Assignment", generated)
+        self.assertNotIn("_apply(", generated)
+        namespace: dict[str, object] = {}
+        with patch("piecad.difference", wraps=difference) as difference_call:
+            exec(generated, namespace)
+        self.assertEqual(len(difference_call.call_args.args), 2)
+        self.assertEqual(namespace["_parts"][0].bounding_box(), (20, 0, 0, 30, 10, 10))
+
+    def test_nested_assignments_with_multiple_minkowski_children(self) -> None:
+        generated = self.translate("""
+            for (i = [1, 2]) {
+                minkowski() {
+                    size = i;
+                    cube(size);
+                    cube(size + 1);
+                }
+            }
+            """)
+
+        class FakeShape:
+            def minkowski_sum(self, other: object) -> FakeShape:
+                return self
+
+        sizes: list[float] = []
+
+        def fake_cube(size: float) -> FakeShape:
+            sizes.append(size)
+            return FakeShape()
+
+        with (
+            patch("piecad.cube", side_effect=fake_cube),
+            patch("piecad.union", side_effect=lambda *shapes: shapes),
+        ):
+            exec(generated, {})
+        self.assertEqual(sizes, [1, 2, 2, 3])
+
+    def test_nested_block_assignments_use_last_value_at_first_assignment(self) -> None:
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            generated = self.translate("""
+                if (true) {
+                    value = echo("discard") 1;
+                    cube(value);
+                    value = echo("keep") 3;
+                }
+                """)
+            output = io.StringIO()
+            namespace: dict[str, object] = {}
+            with redirect_stdout(output):
+                exec(generated, namespace)
+        self.assertEqual(output.getvalue(), "keep\n")
+        self.assertEqual(namespace["_parts"][0].bounding_box(), (0, 0, 0, 3, 3, 3))
+        self.assertTrue(any("duplicate" in str(w.message).lower() for w in caught))
+
+    def test_nested_block_assignment_reads_outer_before_later_binding(self) -> None:
+        generated = self.translate("""
+            value = 5;
+            if (true) {
+                previous = value;
+                value = 9;
+                cube(previous);
+            }
+            """)
+        namespace: dict[str, object] = {}
+        exec(generated, namespace)
+        self.assertEqual(namespace["_parts"][0].bounding_box(), (0, 0, 0, 5, 5, 5))
+        self.assertEqual(namespace["value"], 5)
+
+    def test_nested_assignments_in_let_and_selected_conditional(self) -> None:
+        generated = self.translate("""
+            let (x=2) {
+                x = x+1;
+                if (false) {
+                    size = echo("wrong") x;
+                    cube(size);
+                } else {
+                    size = echo("selected") x;
+                    cube(size);
+                }
+            }
+            """)
+        output = io.StringIO()
+        namespace: dict[str, object] = {}
+        with redirect_stdout(output):
+            exec(generated, namespace)
+        self.assertEqual(output.getvalue(), "selected\n")
+        self.assertEqual(namespace["_parts"][0].bounding_box(), (0, 0, 0, 3, 3, 3))
+
+    def test_nested_block_special_assignments_are_scoped(self) -> None:
+        from piecad import sphere
+
+        generated = self.translate("""
+            $fn = 6;
+            module bead() { sphere(r=1); }
+            for (i = [4, 5]) {
+                $fn = i;
+                bead();
+            }
+            bead();
+            """)
+        self.assertNotIn("FIXME: Assignment", generated)
+        with patch("piecad.sphere", wraps=sphere) as sphere_call:
+            exec(generated, {})
+        self.assertEqual(
+            [call.kwargs["segments"] for call in sphere_call.call_args_list], [4, 5, 6]
+        )
+
     def test_module_assertion_runs_between_geometry_calls(self) -> None:
         from piecad import cube
 
@@ -992,29 +1121,159 @@ class TranslatorTests(unittest.TestCase):
         self.assertEqual(namespace["selected"], [1, 2, 3])
         self.assertEqual(namespace["mixed"], [0, 1, 2, 3, 4])
 
-    def test_marks_c_style_comprehension_node_for_follow_up(self) -> None:
-        position = Position("test.scad", 1, 1)
-        node = Assignment(
-            position=position,
-            name=Identifier(position=position, name="values"),
-            expr=ListComprehension(
-                position=position,
-                elements=[
-                    ListCompCFor(
-                        position=position,
-                        inits=[],
-                        condition=BooleanLiteral(position=position, val=True),
-                        incrs=[],
-                        body=NumberLiteral(position=position, val=1),
-                    )
-                ],
-            ),
+    def test_c_style_comprehensions_support_sequential_updates(self) -> None:
+        generated = self.translate("""
+            numbers = [for (i=0; i<5; i=i+1) i*i];
+            descending = [for (i=3; i>=0; i=i-1) i];
+            fibonacci = [for (a=0, b=1; a<10; x=a+b, a=b, b=x) a];
+            """)
+        self.assertNotIn("C-style list comprehension", generated)
+        namespace: dict[str, object] = {}
+        exec(generated, namespace)
+        self.assertEqual(namespace["numbers"], [0, 1, 4, 9, 16])
+        self.assertEqual(namespace["descending"], [3, 2, 1, 0])
+        self.assertEqual(namespace["fibonacci"], [0, 1, 1, 2, 3, 5, 8])
+        self.assertIn("for i in frange(", generated)
+
+    def test_c_style_comprehensions_preserve_scope_nesting_and_closures(self) -> None:
+        generated = self.translate("""
+            i = 10;
+            values = [for (i=i-2; i<10; i=i+1) i];
+            nested = [for (n=[1, 3]) for (j=0; j<n; j=j+1) [n,j]];
+            callbacks = [for (x=0; x<3; x=x+1) function() x];
+            mixed = [9, for (k=0; k<3; k=k+1) if(k>0) each [k, k+10], 8];
+            """)
+        namespace: dict[str, object] = {}
+        exec(generated, namespace)
+        self.assertEqual(namespace["i"], 10)
+        self.assertEqual(namespace["values"], [8, 9])
+        self.assertEqual(namespace["nested"], [[1, 0], [3, 0], [3, 1], [3, 2]])
+        self.assertEqual([callback() for callback in namespace["callbacks"]], [0, 1, 2])
+        self.assertEqual(namespace["mixed"], [9, 1, 11, 2, 12, 8])
+
+    def test_c_style_comprehensions_preserve_evaluation_order(self) -> None:
+        generated = self.translate("""
+            function value(x) = echo(x) x;
+            values = [for (a=value(0), b=value(a+1);
+                value(a<2); a=value(a+1), b=value(b+1)) value(b)];
+            empty = [for (; false; ) 9];
+            """)
+        output = io.StringIO()
+        namespace: dict[str, object] = {}
+        with redirect_stdout(output):
+            exec(generated, namespace)
+        self.assertEqual(namespace["values"], [1, 2])
+        self.assertEqual(namespace["empty"], [])
+        self.assertEqual(
+            output.getvalue(),
+            "0.0\n1.0\nTrue\n1.0\n1.0\n2.0\nTrue\n2.0\n2.0\n3.0\nFalse\n",
         )
 
-        generated = _Translator().translate([node])
+    def test_c_style_comprehensions_handle_nested_bindings_and_each(self) -> None:
+        generated = self.translate("""
+            list = 10;
+            nested = [for (n=[1,3]) for (i=n; i<n+2; i=i+1) [n,i]];
+            function checked(n) =
+                [for (i=0; assert(i<=n) i<n; i=assert(i<n) i+1)
+                    assert(i<n) i];
+            values = [for (i=0; i<4; i=i+1)
+                if (i==0) each 1
+                else if (i==1) each undef
+                else if (i==2) each [2,3]
+                else each "ab"];
+            """)
+        namespace: dict[str, object] = {}
+        exec(generated, namespace)
+        self.assertEqual(namespace["nested"], [[1, 1], [1, 2], [3, 3], [3, 4]])
+        self.assertEqual(namespace["checked"](3), [0, 1, 2])
+        self.assertEqual(namespace["values"], [1, 2, 3, "a", "b"])
 
-        self.assertIn("pass  # FIXME: C-style list comprehension", generated)
-        compile(generated, "<generated-c-style-comprehension>", "exec")
+    def test_c_style_comprehensions_preserve_float_accumulation(self) -> None:
+        generated = self.translate("""
+            values = [for (i=0; i<0.31; i=i+0.1) i];
+            boundary = [for (i=-4503599627370496; i<=4503599627370495;
+                i=i+4503599627370496) i];
+            """)
+        namespace: dict[str, object] = {}
+        exec(generated, namespace)
+        self.assertEqual(namespace["values"], [0.0, 0.1, 0.2, 0.30000000000000004])
+        self.assertEqual(namespace["boundary"], [-4503599627370496, 0])
+
+    def test_c_style_comprehensions_preserve_duplicate_assignments(self) -> None:
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            generated = self.translate("""
+                function value(x) = echo(x) x;
+                duplicate = [for (i=value(0), i=value(9), v=value(i);
+                    i<2; i=value(i+1), i=value(42)) [i,v]];
+                """)
+            output = io.StringIO()
+            namespace: dict[str, object] = {}
+            with redirect_stdout(output):
+                exec(generated, namespace)
+        self.assertEqual(namespace["duplicate"], [[0, 0], [1, 0]])
+        self.assertEqual(output.getvalue(), "0.0\n9.0\n0.0\n1.0\n42.0\n2.0\n42.0\n")
+        self.assertEqual(len(caught), 3)
+        self.assertTrue(all("duplicate" in str(w.message) for w in caught))
+        self.assertNotIn("UNSUPPORTED", generated)
+
+    def test_c_style_comprehensions_resolve_increment_only_bindings(self) -> None:
+        generated = self.translate("""
+            offset = 4;
+            values = [for (i=0; i<3; i=i+1, offset=offset+1) offset];
+            function nested(offset) =
+                [for (i=0; i<2; i=i+1, offset=offset+1) offset];
+            outer = [for (offset=[2,5])
+                for (i=0; i<2; i=i+1, offset=offset+1) offset];
+            missing = [for (i=0; i<2;
+                i=i+1, x=is_undef(x) ? 7 : x+1) is_undef(x) ? -1 : x];
+            """)
+        namespace: dict[str, object] = {}
+        exec(generated, namespace)
+        self.assertEqual(namespace["values"], [4, 5, 6])
+        self.assertEqual(namespace["nested"](8), [8, 9])
+        self.assertEqual(namespace["outer"], [2, 3, 5, 6])
+        self.assertEqual(namespace["missing"], [-1, 7])
+        self.assertEqual(namespace["offset"], 4)
+        self.assertNotIn("UNSUPPORTED", generated)
+
+    def test_c_style_comprehension_increment_closures_capture_current_scope(
+        self,
+    ) -> None:
+        generated = self.translate("""
+            last = 10;
+            callbacks = [for (i=0, f=function() [-1,-1]; i<4;
+                f=function() assert(i>=0) [i,last], i=i+1, last=last+1) f];
+            later = [for (i=0, f=function() -1; i<3;
+                i=i+1, f=function() i) f];
+            snapshots = [for (i=0; i<3; i=i+1, last=last+1)
+                function() [i,last]];
+            """)
+        namespace: dict[str, object] = {}
+        exec(generated, namespace)
+        self.assertEqual(
+            [callback() for callback in namespace["callbacks"]],
+            [[-1, -1], [0, 10], [1, 11], [2, 12]],
+        )
+        self.assertEqual([callback() for callback in namespace["later"]], [-1, 1, 2])
+        self.assertEqual(
+            [callback() for callback in namespace["snapshots"]],
+            [[0, 10], [1, 11], [2, 12]],
+        )
+        self.assertNotIn("UNSUPPORTED", generated)
+
+    def test_c_style_comprehension_limit_precedes_final_update(self) -> None:
+        generated = self.translate("""
+            values = [for (i=0; i<1000001;
+                i=(i==1000000 ? echo("unexpected") i+1 : i+1)) i];
+            """)
+        output = io.StringIO()
+        with (
+            redirect_stdout(output),
+            self.assertRaisesRegex(RuntimeError, "loop limit exceeded"),
+        ):
+            exec(generated, {})
+        self.assertEqual(output.getvalue(), "")
 
     def test_translates_module_loops_conditionals_and_let(self) -> None:
         generated = self.translate("""
@@ -1997,6 +2256,88 @@ class TranslatorTests(unittest.TestCase):
         self.assertNotIn("import() of .svg files is not supported", generated)
         self.assertNotIn("import() of .dxf files is not supported", generated)
         self.assertIn("v = tuple(map(int, version().split('.')))", generated)
+
+    def test_import_accepts_runtime_filenames_and_preserves_dimensions(self) -> None:
+        from piecad import cube, square
+
+        generated = self.translate("""
+            function filename(n) = echo(n) n == 1 ? "part.stl" : "drawing.svg";
+            translate([1, 2, 3]) import(filename(1));
+            translate([1, 2, 3]) import(file=filename(2), convexity=3);
+            """)
+        self.assertNotIn("import() requires a literal file name", generated)
+        self.assertIn("load(filename(1.0))", generated)
+        self.assertIn("load(filename(2.0))", generated)
+        output = io.StringIO()
+        namespace: dict[str, object] = {}
+        with (
+            patch("piecad.load", side_effect=[cube(1), square(2)]) as load,
+            redirect_stdout(output),
+        ):
+            exec(generated, namespace)
+        self.assertEqual(output.getvalue(), "1.0\n2.0\n")
+        self.assertEqual(
+            [call.args for call in load.call_args_list],
+            [("part.stl",), ("drawing.svg",)],
+        )
+        self.assertEqual(namespace["_parts"][0].bounding_box(), (1, 2, 3, 2, 3, 4))
+        self.assertEqual(namespace["_parts"][1].bounding_box(), (1, 2, 3, 4))
+
+    def test_import_reports_unsupported_layer_instead_of_loading_all_layers(
+        self,
+    ) -> None:
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            generated = self.translate("""
+                filename = "drawing.dxf";
+                import(file=filename, layer="outline");
+                import(file="drawing.dxf", layer="outline");
+                import(filename, "outline");
+                import(file=filename, center=true, id="outline");
+                """)
+        self.assertIn("# UNSUPPORTED: import() parameter(s) layer", generated)
+        self.assertIn(
+            "# UNSUPPORTED: import() parameter(s) positional layer", generated
+        )
+        self.assertIn("# UNSUPPORTED: import() parameter(s) center, id", generated)
+        self.assertNotIn("FIXME: import() parameter(s)", generated)
+        self.assertEqual(len(caught), 4)
+        self.assertTrue(
+            all("UNSUPPORTED: import() parameter(s)" in str(w.message) for w in caught)
+        )
+        self.assertEqual([warning.lineno for warning in caught], [3, 4, 5, 6])
+        with patch("piecad.load") as load:
+            exec(generated, {})
+        load.assert_not_called()
+
+    def test_import_reports_missing_filename(self) -> None:
+        generated = self.translate("import();")
+        self.assertIn("FIXME: import() requires a file name", generated)
+
+    def test_import_loads_runtime_svg_and_propagates_missing_file(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "drawing.svg"
+            path.write_text(
+                '<svg xmlns="http://www.w3.org/2000/svg">'
+                '<path d="M 0 0 L 2 0 L 2 2 L 0 2 Z"/></svg>',
+                encoding="utf-8",
+            )
+            generated = self.translate(f'filename = "{path}"; import(filename);')
+            namespace: dict[str, object] = {}
+            exec(generated, namespace)
+            self.assertEqual(namespace["_parts"][0].bounding_box(), (0, 0, 2, 2))
+            path.unlink()
+            with self.assertRaises(FileNotFoundError):
+                exec(generated, {})
+
+    def test_import_evaluates_assertion_filename_once(self) -> None:
+        from piecad import cube
+
+        generated = self.translate('import(assert(true) "part.stl");')
+        self.assertEqual(generated.count("def _scadtopy_assert_"), 1)
+        with patch("piecad.load", return_value=cube(1)) as load:
+            exec(generated, {})
+        load.assert_called_once_with("part.stl")
 
     def test_export_comment_saves_the_part_to_its_own_file(self) -> None:
         generated = self.translate(
