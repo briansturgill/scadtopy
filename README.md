@@ -27,6 +27,12 @@ Generated `translate()` calls use Piecad's `.translate()` directly when the geom
 
 Dimension inference follows known children through user modules at each call site. Modules that translate their own children still use the adapter when their callers may supply either 2D or 3D geometry.
 
+`rotate()` accepts scalar angles, Euler-angle vectors, and arbitrary axis vectors, including runtime expressions. Rotations of 2D geometry use the corresponding XY projection; a singular projection produces empty geometry with a warning.
+
+`mirror()` accepts 2D or 3D plane-normal vectors, including runtime expressions. A zero vector leaves geometry unchanged; 2D geometry uses the XY projection and warns if that projection is singular.
+
+`polyhedron()` accepts the legacy `triangles` name for `faces` and ignores the preview-only `convexity` parameter.
+
 The deprecated OpenSCAD `child()` selects the first child, while `child(i)` selects child `i`.
 
 The deprecated `assign()` scopes its bindings over its child geometry. Its binding expressions are evaluated independently in the enclosing scope, unlike `let()`. Bindings that shadow generated Python or Piecad calls are reported as unsupported.
@@ -38,6 +44,12 @@ The deprecated `assign()` scopes its bindings over its child geometry. Its bindi
 Function values can be called through expressions, including functions selected from lists, returned by other calls, or chosen conditionally.
 
 Function-level `let` bindings become assignments when this preserves their scope. Common list comprehensions use Python comprehensions and list unpacking; scoped lambda expressions remain where needed to preserve shadowing or closure behavior. C-style comprehensions use `frange` for safe literal integer loops and a scoped generator otherwise. Duplicate bindings evaluate their expressions, produce warnings, and retain the first value. Bindings that cannot be represented as Python identifiers are reported as unsupported.
+
+In list comprehensions, `each` expands lists, ranges, and strings, includes scalar values once, and omits `undef`.
+
+Unsupported `text()` parameters produce warnings and `UNSUPPORTED` comments; the affected text geometry is omitted.
+
+`color()` combines and colors multiple 2D or multiple 3D children. Mixed 2D/3D child groups are unsupported and are reported during translation when detectable, or at runtime otherwise.
 
 Assignments inside nested geometry blocks use scoped Python helpers, preserving loop bindings, shadowing, and child order. When a block assigns the same variable more than once, the last expression is evaluated at the first assignment's position, with a warning.
 

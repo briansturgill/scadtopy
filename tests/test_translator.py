@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import math
 import sys
 import tempfile
 import types
@@ -1121,6 +1122,47 @@ class TranslatorTests(unittest.TestCase):
         self.assertEqual(namespace["selected"], [1, 2, 3])
         self.assertEqual(namespace["mixed"], [0, 1, 2, 3, 4])
 
+    def test_each_handles_scalar_undefined_string_and_range(self) -> None:
+        generated = self.translate("""
+            scalar = [each 1];
+            boolean = [each true];
+            undefined = [each undef];
+            characters = [each "a\u03b2"];
+            numbers = [each [1:3]];
+            mixed = [0, each 1, each undef, each "ab", 2];
+            """)
+        namespace: dict[str, object] = {}
+        exec(generated, namespace)
+        self.assertEqual(namespace["scalar"], [1])
+        self.assertEqual(namespace["boolean"], [True])
+        self.assertEqual(namespace["undefined"], [])
+        self.assertEqual(namespace["characters"], ["a", "\u03b2"])
+        self.assertEqual(namespace["numbers"], [1, 2, 3])
+        self.assertEqual(namespace["mixed"], [0, 1, "a", "b", 2])
+        self.assertIn("scalar = [1.0]", generated)
+
+    def test_each_runtime_values_are_evaluated_once(self) -> None:
+        generated = self.translate("""
+            list = 10;
+            function value(x) = echo("evaluated") x;
+            function expand(x) = [each value(x)];
+            items = [1, 2];
+            copied = expand(items);
+            scalar = expand(7);
+            undefined = expand(undef);
+            characters = expand("ab");
+            """)
+        namespace: dict[str, object] = {}
+        output = io.StringIO()
+        with redirect_stdout(output):
+            exec(generated, namespace)
+        self.assertEqual(output.getvalue(), "evaluated\n" * 4)
+        self.assertEqual(namespace["copied"], [1, 2])
+        self.assertIsNot(namespace["copied"], namespace["items"])
+        self.assertEqual(namespace["scalar"], [7])
+        self.assertEqual(namespace["undefined"], [])
+        self.assertEqual(namespace["characters"], ["a", "b"])
+
     def test_c_style_comprehensions_support_sequential_updates(self) -> None:
         generated = self.translate("""
             numbers = [for (i=0; i<5; i=i+1) i*i];
@@ -1432,6 +1474,54 @@ class TranslatorTests(unittest.TestCase):
         exec(generated, namespace)
         self.assertFalse(namespace["_parts"][0].is_empty())
         self.assertGreater(namespace["_parts"][0].volume(), 0)
+
+    def test_polyhedron_accepts_convexity_and_legacy_triangles(self) -> None:
+        generated = self.translate("""
+            p = [[0,0,0], [1,0,0], [0,1,0], [0,0,1]];
+            f = [[0,1,2], [0,3,1], [0,2,3], [1,3,2]];
+            polyhedron(points=p, faces=f, convexity=10);
+            polyhedron(p, f, 10);
+            polyhedron(points=p, triangles=f, convexity=10);
+            polyhedron(points=p, faces=undef, triangles=f);
+            """)
+        self.assertNotIn("FIXME: polyhedron()", generated)
+        namespace: dict[str, object] = {}
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            exec(generated, namespace)
+        self.assertEqual(len(caught), 0)
+        self.assertEqual(len(namespace["_parts"]), 4)
+        for part in namespace["_parts"]:
+            self.assertAlmostEqual(part.volume(), 1 / 6)
+
+    def test_polyhedron_faces_take_precedence_over_legacy_triangles(self) -> None:
+        generated = self.translate("""
+            p = [[0,0,0], [1,0,0], [0,1,0], [0,0,1]];
+            f = [[0,1,2], [0,3,1], [0,2,3], [1,3,2]];
+            function selected(value) = echo("faces") value;
+            function legacy() = echo("triangles") [];
+            polyhedron(points=p, faces=selected(f), triangles=legacy());
+            polyhedron(points=p, triangles=legacy(), faces=selected(f));
+            """)
+        namespace: dict[str, object] = {}
+        output = io.StringIO()
+        with redirect_stdout(output):
+            exec(generated, namespace)
+        self.assertEqual(output.getvalue(), "faces\ntriangles\ntriangles\nfaces\n")
+        for part in namespace["_parts"]:
+            self.assertAlmostEqual(part.volume(), 1 / 6)
+
+    def test_polyhedron_rejects_bad_arguments_and_reports_missing_faces(self) -> None:
+        generated = self.translate("polyhedron(points=[[0,0,0]], convexity=10);")
+        self.assertIn("FIXME: polyhedron() requires points and faces", generated)
+        for source in (
+            "polyhedron([], [], 1, 2);",
+            "polyhedron(points=[], faces=[], unknown=1);",
+            "polyhedron([], points=[], faces=[]);",
+        ):
+            with self.subTest(source=source):
+                with self.assertRaises(TranslationError):
+                    self.translate(source)
 
     def test_translates_t_scad_geometry_end_to_end(self) -> None:
         generated = self.translate("""
@@ -1884,6 +1974,107 @@ class TranslatorTests(unittest.TestCase):
         plain = namespace["text"](size=10, text="Hig").bounding_box()
         left = helper("Hig", 10, "left", "baseline").bounding_box()
         self.assertEqual(plain, left)
+
+    def test_text_unsupported_parameters_warn_and_are_marked(self) -> None:
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            generated = self.translate("""
+                text("A", font="Liberation Sans", spacing=1.2);
+                text("B", $fn=16, direction="rtl");
+                text("C", 10, "Arial");
+                linear_extrude(3) text("E", language="ar", script="arabic");
+                text("D", size=10);
+                """)
+
+        self.assertIn("# UNSUPPORTED: text() parameter(s) font, spacing", generated)
+        self.assertIn("# UNSUPPORTED: text() parameter(s) $fn, direction", generated)
+        self.assertIn(
+            "# UNSUPPORTED: text() parameter(s) positional arguments after size",
+            generated,
+        )
+        self.assertIn("# UNSUPPORTED: text() parameter(s) language, script", generated)
+        self.assertNotIn("FIXME: text()", generated)
+        self.assertEqual(len(caught), 4)
+        self.assertTrue(
+            all("UNSUPPORTED: text()" in str(item.message) for item in caught)
+        )
+        namespace: dict[str, object] = {}
+        exec(generated, namespace)
+        self.assertEqual(len(namespace["_parts"]), 1)
+
+    def test_text_without_content_is_reported_as_unsupported(self) -> None:
+        with self.assertWarnsRegex(UserWarning, r"UNSUPPORTED: text\(\)"):
+            generated = self.translate("text();")
+        self.assertIn("# UNSUPPORTED: text()", generated)
+        self.assertNotIn("FIXME: text()", generated)
+
+    def test_color_combines_multiple_children_and_preserves_scopes(self) -> None:
+        from piecad import Obj3d
+
+        generated = self.translate("""
+            color("red") { cube(1); translate([2, 0, 0]) cube(1); }
+            color([0, 1, 0]) { square(1); translate([2, 0]) square(1); }
+            for (i = [1:2]) color("blue") {
+                size = i;
+                cube(size);
+                translate([3, 0, 0]) cube(size);
+            }
+            color("red") {}
+            """)
+        self.assertNotIn("color() requires exactly one child", generated)
+        namespace: dict[str, object] = {}
+        exec(generated, namespace)
+        solid, flat, repeated = namespace["_parts"]
+        self.assertEqual(solid.bounding_box(), (0, 0, 0, 3, 1, 1))
+        self.assertEqual(Obj3d.color_map[solid.mo.original_id()], (255, 0, 0))
+        self.assertEqual(flat.bounding_box(), (0, 0, 3, 1))
+        self.assertEqual(flat._color, (0, 255, 0))
+        self.assertEqual(repeated.bounding_box(), (0, 0, 0, 5, 2, 2))
+
+    def test_color_multi_child_evaluates_color_once_and_skips_empty_children(
+        self,
+    ) -> None:
+        generated = self.translate("""
+            function selected_color() = echo("color") "red";
+            color(selected_color()) {
+                if (false) cube(1);
+                cube(2);
+            }
+            """)
+        namespace: dict[str, object] = {}
+        output = io.StringIO()
+        with redirect_stdout(output):
+            exec(generated, namespace)
+        self.assertEqual(output.getvalue(), "color\n")
+        self.assertEqual(namespace["_parts"][0].bounding_box(), (0, 0, 0, 2, 2, 2))
+
+    def test_color_mixed_dimensions_are_reported_unsupported(self) -> None:
+        with self.assertWarnsRegex(UserWarning, r"UNSUPPORTED: color\(\).*(2D|3D)"):
+            generated = self.translate('color("red") { square(1); cube(1); }')
+        self.assertIn("# UNSUPPORTED: color()", generated)
+        self.assertNotIn("FIXME: color()", generated)
+        compile(generated, "<generated-color>", "exec")
+
+    def test_color_dynamic_mixed_dimensions_fail_explicitly(self) -> None:
+        generated = self.translate("""
+            module shape(flat) if (flat) square(1); else cube(1);
+            color("red") { shape(flat); cube(1); }
+            """)
+        namespace: dict[str, object] = {"flat": False}
+        exec(generated, namespace)
+        self.assertEqual(namespace["_parts"][0].bounding_box(), (0, 0, 0, 1, 1, 1))
+        with self.assertRaisesRegex(ValueError, r"UNSUPPORTED: color\(\).*(2D|3D)"):
+            exec(generated, {"flat": True})
+
+    def test_color_group_helper_does_not_shadow_user_identifiers(self) -> None:
+        generated = self.translate("""
+            _scadtopy_color_group = 5;
+            color("red") { cube(_scadtopy_color_group); cube(1); }
+            """)
+        namespace: dict[str, object] = {}
+        exec(generated, namespace)
+        self.assertEqual(namespace["_scadtopy_color_group"], 5)
+        self.assertEqual(namespace["_parts"][0].bounding_box(), (0, 0, 0, 5, 5, 5))
 
     def test_collects_each_part_for_viewing(self) -> None:
         generated = self.translate("cube(1);\ntranslate([5,0,0]) sphere(2);\n")
@@ -2549,6 +2740,152 @@ class TranslatorTests(unittest.TestCase):
         self.assertIn(".scale([2.0, 2.0, 2.0])", generated)
         self.assertIn(".mirror((False, True, False))", generated)
         compile(generated, "<generated>", "exec")
+
+    def test_rotate_dynamic_angles_axes_and_two_dimensional_geometry(self) -> None:
+        generated = self.translate("""
+            angles = [23, 41, 67];
+            axis = [1, 1, 0];
+            rotate(angles) cube([1, 2, 3]);
+            rotate(90, axis) cube([1, 1, 2]);
+            rotate(90) square([1, 2]);
+            rotate([60, 0, 0]) square([1, 2]);
+            rotate(60, [1, 0]) square([1, 2]);
+            rotate(90, [0, 0, -2]) square([1, 2]);
+            rotate(45, [0, 0, 0]) cube(1);
+            rotate([60, 0, 90]) square([1, 2]);
+            """)
+        self.assertNotIn("rotate() requires a literal 3-vector", generated)
+        namespace: dict[str, object] = {}
+        exec(generated, namespace)
+        parts = namespace["_parts"]
+        from piecad import cube
+
+        reference = (
+            cube([1, 2, 3]).rotate([23, 0, 0]).rotate([0, 41, 0]).rotate([0, 0, 67])
+        )
+        for actual, expected in zip(parts[0].bounding_box(), reference.bounding_box()):
+            self.assertAlmostEqual(actual, expected)
+        diagonal_bounds = (
+            0,
+            -math.sqrt(2),
+            -math.sqrt(0.5),
+            1 + math.sqrt(2),
+            1,
+            math.sqrt(0.5),
+        )
+        for actual, expected in zip(parts[1].bounding_box(), diagonal_bounds):
+            self.assertAlmostEqual(actual, expected)
+        self.assertEqual(parts[2].bounding_box(), (-2, 0, 0, 1))
+        for flat in parts[3:5]:
+            for actual, expected in zip(flat.bounding_box(), (0, 0, 1, 1)):
+                self.assertAlmostEqual(actual, expected)
+        self.assertEqual(parts[5].bounding_box(), (0, -1, 2, 0))
+        self.assertEqual(parts[6].bounding_box(), (0, 0, 0, 1, 1, 1))
+        for actual, expected in zip(parts[7].bounding_box(), (-1, 0, 0, 1)):
+            self.assertAlmostEqual(actual, expected)
+
+    def test_rotate_runtime_arguments_and_unknown_geometry(self) -> None:
+        generated = self.translate("""
+            _scadtopy_rotate = 5;
+            function angle() = echo("angle") [0, 0, 90];
+            function axis() = echo("axis") [1, 1, 0];
+            module shape(flat) if (flat) square(1); else cube(1);
+            rotate(angle(), axis()) shape(true);
+            rotate(90) shape(false);
+            """)
+        namespace: dict[str, object] = {}
+        output = io.StringIO()
+        with redirect_stdout(output):
+            exec(generated, namespace)
+        self.assertEqual(output.getvalue(), "angle\naxis\n")
+        self.assertEqual(namespace["_scadtopy_rotate"], 5)
+        self.assertEqual(namespace["_parts"][0].bounding_box(), (-1, 0, 0, 1))
+        self.assertEqual(namespace["_parts"][1].bounding_box(), (-1, 0, 0, 0, 1, 1))
+
+    def test_rotate_invalid_runtime_vectors_fail_explicitly(self) -> None:
+        generated = self.translate("rotate(a, v) cube(1);")
+        with self.assertRaisesRegex(ValueError, "axis must be a 2- or 3-vector"):
+            exec(generated, {"a": 45, "v": [1]})
+        with self.assertRaisesRegex(ValueError, "angle vector must have at most 3"):
+            exec(generated, {"a": [1, 2, 3, 4], "v": [0, 0, 1]})
+
+    def test_rotate_singular_two_dimensional_projection_is_empty(self) -> None:
+        generated = self.translate("""
+            rotate([90, 0, 0]) square(1);
+            rotate(90, [1, 0, 0]) square(1);
+            """)
+        namespace: dict[str, object] = {}
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            exec(generated, namespace)
+        self.assertEqual(len(caught), 2)
+        self.assertTrue(all(part.is_empty() for part in namespace["_parts"]))
+
+    def test_mirror_supports_arbitrary_and_dynamic_vectors(self) -> None:
+        generated = self.translate("""
+            v = [1, 2, 3];
+            component = -2;
+            mirror(v) cube([1, 2, 3]);
+            mirror([1, 1, 1]) square([1, 2]);
+            mirror([component, 0, 0]) cube(1);
+            mirror([1, 0]) square(1);
+            mirror([0, 0, 1]) square(1);
+            mirror([0, 0, 0]) cube(1);
+            mirror([1, -1, 0]) square([1, 2]);
+            mirror([1e300, 2e300, 3e300]) cube([1, 2, 3]);
+            """)
+        self.assertNotIn("FIXME: mirror()", generated)
+        namespace: dict[str, object] = {}
+        exec(generated, namespace)
+        parts = namespace["_parts"]
+        for actual, expected in zip(
+            parts[0].bounding_box(), (-13 / 7, -20 / 7, -3, 6 / 7, 6 / 7, 0)
+        ):
+            self.assertAlmostEqual(actual, expected)
+        for actual, expected in zip(
+            parts[1].bounding_box(), (-4 / 3, -2 / 3, 1 / 3, 2 / 3)
+        ):
+            self.assertAlmostEqual(actual, expected)
+        self.assertEqual(parts[2].bounding_box(), (-1, 0, 0, 0, 1, 1))
+        self.assertEqual(parts[3].bounding_box(), (-1, 0, 0, 1))
+        self.assertEqual(parts[4].bounding_box(), (0, 0, 1, 1))
+        self.assertEqual(parts[5].bounding_box(), (0, 0, 0, 1, 1, 1))
+        self.assertEqual(parts[6].bounding_box(), (0, 0, 2, 1))
+        for actual, expected in zip(parts[7].bounding_box(), parts[0].bounding_box()):
+            self.assertAlmostEqual(actual, expected)
+
+    def test_mirror_runtime_geometry_evaluates_vector_once(self) -> None:
+        generated = self.translate("""
+            _scadtopy_mirror = 5;
+            _scadtopy_projected_transform = 7;
+            function axis() = echo("axis") [0, 0, 1];
+            module shape(flat) if (flat) square(1); else cube(1);
+            mirror(axis()) shape(true);
+            mirror(axis()) shape(false);
+            mirror([1, 1, 1]) shape(true);
+            """)
+        namespace: dict[str, object] = {}
+        output = io.StringIO()
+        with redirect_stdout(output):
+            exec(generated, namespace)
+        self.assertEqual(output.getvalue(), "axis\naxis\n")
+        self.assertEqual(namespace["_scadtopy_mirror"], 5)
+        self.assertEqual(namespace["_scadtopy_projected_transform"], 7)
+        self.assertEqual(namespace["_parts"][0].bounding_box(), (0, 0, 1, 1))
+        self.assertEqual(namespace["_parts"][1].bounding_box(), (0, 0, -1, 1, 1, 0))
+        for actual, expected in zip(
+            namespace["_parts"][2].bounding_box(), (-2 / 3, -2 / 3, 1 / 3, 1 / 3)
+        ):
+            self.assertAlmostEqual(actual, expected)
+
+    def test_mirror_singular_projection_and_invalid_vector(self) -> None:
+        generated = self.translate("mirror(v) square(1);")
+        namespace: dict[str, object] = {"v": [1, 0, 1]}
+        with self.assertWarnsRegex(UserWarning, "mirror.*singular"):
+            exec(generated, namespace)
+        self.assertTrue(namespace["_parts"][0].is_empty())
+        with self.assertRaisesRegex(ValueError, "mirror.*2- or 3-vector"):
+            exec(generated, {"v": [1]})
 
     def test_translates_multmatrix_with_three_or_four_rows(self) -> None:
         matrix_3x4 = self.translate(

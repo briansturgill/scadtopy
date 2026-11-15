@@ -566,6 +566,27 @@ def _position(node: object) -> str:
     return f" at line {line}" if line is not None else ""
 
 
+def _literal_numeric_vector(
+    expression: object, lengths: tuple[int, ...]
+) -> list[float] | None:
+    if (
+        not isinstance(expression, ListComprehension)
+        or len(expression.elements) not in lengths
+    ):
+        return None
+    values = []
+    for element in expression.elements:
+        if isinstance(element, NumberLiteral):
+            values.append(element.val)
+        elif isinstance(element, UnaryMinusOp) and isinstance(
+            element.expr, NumberLiteral
+        ):
+            values.append(-element.expr.val)
+        else:
+            return None
+    return values
+
+
 class _Translator:
     def __init__(self) -> None:
         self.output_stem = ""
@@ -587,7 +608,14 @@ class _Translator:
         self.uses_children_helper = False
         self.uses_linear_extrude_helper = False
         self.uses_text_helper = False
+        self.uses_color_group_helper = False
+        self.color_group_helper = "_scadtopy_color_group"
         self.uses_translate_helper = False
+        self.uses_rotate_helper = False
+        self.rotate_helper = "_scadtopy_rotate"
+        self.uses_mirror_helper = False
+        self.mirror_helper = "_scadtopy_mirror"
+        self.projected_transform_helper = "_scadtopy_projected_transform"
         self.uses_resize_helper = False
         self.uses_segments_helper = False
         self.segment_unset = "_scadtopy_unset"
@@ -642,7 +670,10 @@ class _Translator:
         self.uses_children_helper = False
         self.uses_linear_extrude_helper = False
         self.uses_text_helper = False
+        self.uses_color_group_helper = False
         self.uses_translate_helper = False
+        self.uses_rotate_helper = False
+        self.uses_mirror_helper = False
         self.uses_resize_helper = False
         self.uses_segments_helper = False
         self.uses_vec2 = False
@@ -669,6 +700,22 @@ class _Translator:
         for node in nodes:
             if isinstance(node, UseStatement):
                 self.load_used_names(node)
+        self.color_group_helper = "_scadtopy_color_group"
+        while self.color_group_helper in (
+            self.user_identifiers | self.imported_identifiers
+        ):
+            self.color_group_helper += "_"
+        self.rotate_helper = "_scadtopy_rotate"
+        while self.rotate_helper in self.user_identifiers | self.imported_identifiers:
+            self.rotate_helper += "_"
+        self.mirror_helper = "_scadtopy_mirror"
+        while self.mirror_helper in self.user_identifiers | self.imported_identifiers:
+            self.mirror_helper += "_"
+        self.projected_transform_helper = "_scadtopy_projected_transform"
+        while self.projected_transform_helper in (
+            self.user_identifiers | self.imported_identifiers
+        ):
+            self.projected_transform_helper += "_"
         self.segment_modules = _segment_module_requirements(
             nodes, self.source_path, self.base_dir
         )
@@ -862,6 +909,96 @@ class _Translator:
                 "        vector = vector[:2]\n"
                 "    return obj.translate(vector)\n\n"
             )
+        if self.uses_rotate_helper or self.uses_mirror_helper:
+            prefix += (
+                f"def {self.projected_transform_helper}(obj, a, b, c, d, operation):\n"
+                "    if a * d - b * c == 0:\n"
+                "        import warnings\n"
+                "        from piecad import difference\n"
+                "        warnings.warn(f'{operation}() removes 2D geometry with a singular transform', stacklevel=2)\n"
+                "        return difference(obj, obj)\n"
+                "    return obj.transform(((a, b, 0), (c, d, 0)))\n\n"
+            )
+        if self.uses_rotate_helper:
+            prefix += (
+                f"def {self.rotate_helper}(obj, angle, axis=None):\n"
+                "    import builtins\n"
+                "    import math\n"
+                "    from piecad import Obj2d, Obj3d\n"
+                "    if not builtins.isinstance(obj, (Obj2d, Obj3d)):\n"
+                "        raise builtins.TypeError('rotate() requires an Obj2d or Obj3d')\n"
+                "    def trig(degrees):\n"
+                "        quarter = degrees % 360\n"
+                "        if quarter in (0, 90, 180, 270):\n"
+                "            return {0: (0, 1), 90: (1, 0), 180: (0, -1), 270: (-1, 0)}[quarter]\n"
+                "        radians = math.radians(degrees)\n"
+                "        return math.sin(radians), math.cos(radians)\n"
+                "    if builtins.isinstance(angle, (builtins.list, builtins.tuple)):\n"
+                "        if builtins.len(angle) > 3:\n"
+                "            raise builtins.ValueError('rotate() angle vector must have at most 3 components')\n"
+                "        angles = builtins.list(angle) + [0] * (3 - builtins.len(angle))\n"
+                "        if builtins.isinstance(obj, Obj3d):\n"
+                "            return obj.rotate(angles)\n"
+                "        if angles[0] == 0 and angles[1] == 0:\n"
+                "            return obj.rotate(angles[2])\n"
+                "        sx, cx = trig(angles[0])\n"
+                "        sy, cy = trig(angles[1])\n"
+                "        sz, cz = trig(angles[2])\n"
+                f"        return {self.projected_transform_helper}(obj, cy * cz, cz * sx * sy - cx * sz,\n"
+                "            cy * sz, cx * cz + sx * sy * sz, 'rotate')\n"
+                "    if axis is None:\n"
+                "        return obj.rotate(angle if builtins.isinstance(obj, Obj2d) else [0, 0, angle])\n"
+                "    if not builtins.isinstance(axis, (builtins.list, builtins.tuple)) or builtins.len(axis) not in (2, 3):\n"
+                "        raise builtins.ValueError('rotate() axis must be a 2- or 3-vector')\n"
+                "    x, y = axis[:2]\n"
+                "    z = axis[2] if builtins.len(axis) == 3 else 0\n"
+                "    magnitude = math.hypot(x, y, z)\n"
+                "    if magnitude == 0:\n"
+                "        return obj\n"
+                "    if x == 0 and y == 0:\n"
+                "        angle = angle if z > 0 else -angle\n"
+                "        return obj.rotate(angle if builtins.isinstance(obj, Obj2d) else [0, 0, angle])\n"
+                "    x, y, z = x / magnitude, y / magnitude, z / magnitude\n"
+                "    sine, cosine = trig(angle)\n"
+                "    t = 1 - cosine\n"
+                "    matrix = ((t*x*x + cosine, t*x*y - sine*z, t*x*z + sine*y, 0),\n"
+                "              (t*x*y + sine*z, t*y*y + cosine, t*y*z - sine*x, 0),\n"
+                "              (t*x*z - sine*y, t*y*z + sine*x, t*z*z + cosine, 0))\n"
+                "    if builtins.isinstance(obj, Obj2d):\n"
+                f"        return {self.projected_transform_helper}(obj, matrix[0][0], matrix[0][1], matrix[1][0], matrix[1][1], 'rotate')\n"
+                "    return obj.transform(matrix)\n\n"
+            )
+        if self.uses_mirror_helper:
+            prefix += (
+                f"def {self.mirror_helper}(obj, axis):\n"
+                "    import builtins\n"
+                "    import math\n"
+                "    from piecad import Obj2d, Obj3d\n"
+                "    if not builtins.isinstance(obj, (Obj2d, Obj3d)):\n"
+                "        raise builtins.TypeError('mirror() requires an Obj2d or Obj3d')\n"
+                "    if not builtins.isinstance(axis, (builtins.list, builtins.tuple)) or builtins.len(axis) not in (2, 3):\n"
+                "        raise builtins.ValueError('mirror() axis must be a 2- or 3-vector')\n"
+                "    if not builtins.all(builtins.type(value) in (builtins.int, builtins.float) and math.isfinite(value) for value in axis):\n"
+                "        raise builtins.ValueError('mirror() axis must contain finite numbers')\n"
+                "    x, y = axis[:2]\n"
+                "    z = axis[2] if builtins.len(axis) == 3 else 0\n"
+                "    scale = builtins.max(builtins.abs(x), builtins.abs(y), builtins.abs(z))\n"
+                "    if scale == 0:\n"
+                "        return obj\n"
+                "    if x == 0 and y == 0 and builtins.isinstance(obj, Obj2d):\n"
+                "        return obj\n"
+                "    if builtins.sum(value != 0 for value in (x, y, z)) == 1:\n"
+                "        flags = (x != 0, y != 0, z != 0)\n"
+                "        return obj.mirror(flags[:2] if builtins.isinstance(obj, Obj2d) else flags)\n"
+                "    x, y, z = x / scale, y / scale, z / scale\n"
+                "    factor = 2 / (x*x + y*y + z*z)\n"
+                "    matrix = ((1 - factor*x*x, -factor*x*y, -factor*x*z, 0),\n"
+                "              (-factor*x*y, 1 - factor*y*y, -factor*y*z, 0),\n"
+                "              (-factor*x*z, -factor*y*z, 1 - factor*z*z, 0))\n"
+                "    if builtins.isinstance(obj, Obj2d):\n"
+                f"        return {self.projected_transform_helper}(obj, matrix[0][0], matrix[0][1], matrix[1][0], matrix[1][1], 'mirror')\n"
+                "    return obj.transform(matrix)\n\n"
+            )
         if self.uses_resize_helper:
             prefix += (
                 "def _scadtopy_resize(obj, newsize, auto=False):\n"
@@ -919,6 +1056,19 @@ class _Translator:
                 "    picked = [child for child in picked if child is not None]\n"
                 "    return union(*picked) if len(picked) > 1 "
                 "else (picked[0] if picked else None)\n\n"
+            )
+        if self.uses_color_group_helper:
+            prefix += (
+                f"def {self.color_group_helper}(color, *children):\n"
+                "    import builtins\n"
+                "    children = [child for child in children if child is not None]\n"
+                "    if not children:\n"
+                "        return None\n"
+                "    if builtins.any(builtins.type(child) is not builtins.type(children[0]) "
+                "for child in children):\n"
+                "        raise builtins.ValueError('UNSUPPORTED: color() cannot combine 2D and 3D children')\n"
+                "    geometry = union(*children) if builtins.len(children) > 1 else children[0]\n"
+                "    return geometry.color(color)\n\n"
             )
         if self.uses_text_helper:
             prefix += (
@@ -1991,21 +2141,38 @@ class _Translator:
             return self.combine(children) if children else "None"
         if name == "color":
             self.reject_unexpected_named_arguments(node, {"c", "alpha"})
-            if len(children) != 1:
-                self.note_fixme(node, "color() requires exactly one child")
+            if not children:
+                return "None"
+            dimensions = {
+                2 if child.name.name in {"square", "circle", "polygon"} else 3
+                for child in source_children
+                if isinstance(child, ModularCall)
+                and child.name.name
+                in {"square", "circle", "polygon", "cube", "sphere", "cylinder"}
+                and child.name.name not in self.module_names
+            }
+            if len(dimensions) > 1:
+                self.note_unsupported(
+                    node, "color() cannot combine 2D and 3D child geometry"
+                )
                 return "None"
             color = self.argument_expression(node.arguments, ("c",), 0)
             if color is None:
                 self.note_fixme(node, "color() without a color argument")
-                return children[0]
+                return self.combine(children)
             if isinstance(color, ListComprehension):
                 values = [self.expression(value) for value in color.elements]
                 if len(values) not in {3, 4}:
                     self.note_fixme(node, "only RGB/RGBA color vectors are supported")
-                    return children[0]
+                    return self.combine(children)
                 rgb = ", ".join(f"round(({value}) * 255)" for value in values[:3])
-                return f"{_receiver(children[0])}.color(({rgb}))"
-            return f"{_receiver(children[0])}.color({self.expression(color)})"
+                color_value = f"({rgb})"
+            else:
+                color_value = self.expression(color)
+            if len(children) == 1:
+                return f"{_receiver(children[0])}.color({color_value})"
+            self.uses_color_group_helper = True
+            return f"{self.color_group_helper}({color_value}, {', '.join(children)})"
         if name == "text":
             self.reject_children(node, children)
             text = self.argument_value(node.arguments, ("text",), 0)
@@ -2018,19 +2185,28 @@ class _Translator:
                 if isinstance(argument, NamedArgument)
             } - {"text", "size", "halign", "valign"}
             positional = [a for a in node.arguments if not isinstance(a, NamedArgument)]
-            if text is not None and not unsupported_arguments and len(positional) <= 2:
-                size = size or "10"
-                if halign is None and valign is None:
-                    return f"text(size={size}, text={text})"
-                self.uses_text_helper = True
-                return (
-                    f"_scadtopy_text({text}, {size}, "
-                    f"{halign or repr('left')}, {valign or repr('baseline')})"
+            if len(positional) > 2:
+                unsupported_arguments.add("positional arguments after size")
+            if unsupported_arguments:
+                self.note_unsupported(
+                    node,
+                    f"text() parameter(s) {', '.join(sorted(unsupported_arguments))} "
+                    "are not translated; text geometry is omitted",
                 )
-            self.note_fixme(
-                node, "text() supports only text, size, halign and valign in Piecad"
+                return "None"
+            if text is None:
+                self.note_unsupported(
+                    node, "text() without a text argument is not translated"
+                )
+                return "None"
+            size = size or "10"
+            if halign is None and valign is None:
+                return f"text(size={size}, text={text})"
+            self.uses_text_helper = True
+            return (
+                f"_scadtopy_text({text}, {size}, "
+                f"{halign or repr('left')}, {valign or repr('baseline')})"
             )
-            return "None"
         if name == "import":
             self.reject_children(node, children)
             file_node = self.argument_expression(node.arguments, ("file",), 0)
@@ -2079,9 +2255,68 @@ class _Translator:
             return f"load({filename})"
         if name == "polyhedron":
             self.reject_children(node, children)
+            self.reject_unexpected_named_arguments(
+                node, {"points", "faces", "triangles", "convexity"}
+            )
+            positional = sum(
+                isinstance(argument, PositionalArgument) for argument in node.arguments
+            )
+            if positional > 3:
+                raise TranslationError(
+                    f"Too many polyhedron() arguments{_position(node)}"
+                )
+            for position, parameter in enumerate(("points", "faces", "convexity")):
+                named = sum(
+                    isinstance(argument, NamedArgument)
+                    and argument.name.name == parameter
+                    for argument in node.arguments
+                )
+                if named > 1 or (named and positional > position):
+                    raise TranslationError(
+                        f"polyhedron() got multiple values for {parameter!r}{_position(node)}"
+                    )
+            if (
+                sum(
+                    isinstance(argument, NamedArgument)
+                    and argument.name.name == "triangles"
+                    for argument in node.arguments
+                )
+                > 1
+            ):
+                raise TranslationError(
+                    f"polyhedron() got multiple values for 'triangles'{_position(node)}"
+                )
             points = self.argument_value(node.arguments, ("points",), 0)
             faces = self.argument_value(node.arguments, ("faces",), 1)
-            if points is not None and faces is not None and len(node.arguments) <= 2:
+            legacy_faces = self.argument_value(node.arguments, ("triangles",), -1)
+            if faces is None:
+                faces = legacy_faces
+            elif legacy_faces is not None:
+                face_argument = self.argument_expression(node.arguments, ("faces",), 1)
+                legacy_argument = self.argument_expression(
+                    node.arguments, ("triangles",), -1
+                )
+                ordered = [
+                    argument.expr
+                    for argument in node.arguments
+                    if isinstance(argument, (NamedArgument, PositionalArgument))
+                ]
+                legacy_first = next(
+                    value is legacy_argument
+                    for value in ordered
+                    if value is face_argument or value is legacy_argument
+                )
+                parameters = "triangles, faces" if legacy_first else "faces, triangles"
+                values = (
+                    f"{legacy_faces}, {faces}"
+                    if legacy_first
+                    else f"{faces}, {legacy_faces}"
+                )
+                faces = (
+                    f"(lambda {parameters}: faces if faces is not None else triangles)"
+                    f"({values})"
+                )
+            if points is not None and faces is not None:
                 triangles = (
                     f"[tuple(int(index) for index in "
                     f"(face[0], face[i + 1], face[i])) "
@@ -2282,29 +2517,40 @@ class _Translator:
             axis = self.argument_expression(node.arguments, ("v",), 1)
             if angle is None or len(node.arguments) not in {1, 2}:
                 raise TranslationError(f"rotate() requires an angle{_position(node)}")
-            if axis is None:
-                if isinstance(angle, ListComprehension):
-                    angles = self.expression(angle)
-                else:
-                    rendered_angle = self.expression(angle)
-                    angles = f"[0, 0, {rendered_angle}]"
-            else:
-                if isinstance(angle, ListComprehension):
-                    raise TranslationError(
-                        f"rotate() with an axis requires a scalar angle{_position(node)}"
+            rendered_angle = self.expression(angle)
+            dimensions = self.geometry_dimension(node.children)
+            scalar_literal = isinstance(angle, NumberLiteral) or (
+                isinstance(angle, UnaryMinusOp)
+                and isinstance(angle.expr, NumberLiteral)
+            )
+            if scalar_literal and dimensions == 3:
+                axis_values = _literal_numeric_vector(axis, (3,))
+                if (
+                    axis_values is not None
+                    and sum(value != 0 for value in axis_values) == 1
+                ):
+                    axis_index = next(
+                        i for i, value in enumerate(axis_values) if value != 0
                     )
-                axis_values = self.literal_axis(axis, name)
-                if axis_values is None:
-                    return "None"
-                axis_index = next(
-                    index for index, value in enumerate(axis_values) if value != 0
+                    angles = ["0", "0", "0"]
+                    sign = "-" if axis_values[axis_index] < 0 else ""
+                    angles[axis_index] = f"{sign}({rendered_angle})"
+                    return f"{_receiver(geometry)}.rotate([{', '.join(angles)}])"
+            if axis is None and scalar_literal and dimensions in (2, 3):
+                angles = (
+                    rendered_angle if dimensions == 2 else f"[0, 0, {rendered_angle}]"
                 )
-                rendered_angle = self.expression(angle)
-                angles_list = ["0", "0", "0"]
-                sign = "-" if axis_values[axis_index] < 0 else ""
-                angles_list[axis_index] = f"{sign}({rendered_angle})"
-                angles = f"[{', '.join(angles_list)}]"
-            return f"{_receiver(geometry)}.rotate({angles})"
+                return f"{_receiver(geometry)}.rotate({angles})"
+            if (
+                axis is None
+                and isinstance(angle, ListComprehension)
+                and len(angle.elements) == 3
+                and dimensions == 3
+            ):
+                return f"{_receiver(geometry)}.rotate({rendered_angle})"
+            self.uses_rotate_helper = True
+            rendered_axis = f", {self.expression(axis)}" if axis is not None else ""
+            return f"{self.rotate_helper}({_receiver(geometry)}, {rendered_angle}{rendered_axis})"
 
         if name == "mirror":
             self.reject_unexpected_named_arguments(node, {"v"})
@@ -2313,39 +2559,24 @@ class _Translator:
                 raise TranslationError(
                     f"mirror() requires one axis vector{_position(node)}"
                 )
-            axis_values = self.literal_axis(axis, name)
-            if axis_values is None:
-                return "None"
-            flags = [str(value != 0) for value in axis_values]
-            return f"{_receiver(geometry)}.mirror(({', '.join(flags)}))"
+            axis_values = _literal_numeric_vector(axis, (2, 3))
+            dimensions = self.geometry_dimension(node.children)
+            if axis_values is not None:
+                axis_values += [0] * (3 - len(axis_values))
+                nonzero = sum(value != 0 for value in axis_values)
+                if nonzero == 0 or (
+                    dimensions == 2 and axis_values[0] == axis_values[1] == 0
+                ):
+                    return geometry
+                if nonzero == 1 and dimensions in (2, 3):
+                    flags = [str(value != 0) for value in axis_values[:dimensions]]
+                    return f"{_receiver(geometry)}.mirror(({', '.join(flags)}))"
+            self.uses_mirror_helper = True
+            return (
+                f"{self.mirror_helper}({_receiver(geometry)}, {self.expression(axis)})"
+            )
 
         raise AssertionError(f"Missing transform mapping for {name}")
-
-    def literal_axis(self, expression: object, operation: str) -> list[float] | None:
-        if (
-            not isinstance(expression, ListComprehension)
-            or len(expression.elements) != 3
-        ):
-            self.note_fixme(expression, f"{operation}() requires a literal 3-vector")
-            return None
-        values: list[float] = []
-        for element in expression.elements:
-            if isinstance(element, NumberLiteral):
-                values.append(element.val)
-            elif isinstance(element, UnaryMinusOp) and isinstance(
-                element.expr, NumberLiteral
-            ):
-                values.append(-element.expr.val)
-            else:
-                self.note_fixme(expression, f"{operation}() vector is not a literal")
-                return None
-        nonzero = [value for value in values if value != 0]
-        if len(nonzero) != 1:
-            self.note_fixme(
-                expression, f"{operation}() vector must have one nonzero axis component"
-            )
-            return None
-        return values
 
     def reject_children(self, node: ModularCall, children: list[str]) -> None:
         if children:
@@ -2832,10 +3063,15 @@ class _Translator:
         controls = (ListCompCFor, ListCompFor, ListCompIf, ListCompIfElse)
         if len(elements) == 1 and isinstance(elements[0], ListCompEach):
             element = elements[0]
-            value = self.vector_element_value(element.body)
-            if isinstance(element.body, ListComprehension):
-                return value
-            return f"[] + ({value})"
+            if isinstance(element.body, (ListComprehension, RangeLiteral)):
+                return self.expression(element.body)
+            if isinstance(element.body, UndefinedLiteral):
+                return "[]"
+            if isinstance(element.body, (NumberLiteral, BooleanLiteral)):
+                return f"[{self.expression(element.body)}]"
+            if isinstance(element.body, StringLiteral):
+                return f"[*{self.expression(element.body)}]"
+            return self.vector_segment(element)
         if any(
             isinstance(element, ListCompLet)
             or (
