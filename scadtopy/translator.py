@@ -312,6 +312,191 @@ def _children_modules(nodes: Iterable[object]) -> set[str]:
     return names
 
 
+_SEGMENT_VARIABLES = ("$fn", "$fa", "$fs")
+
+
+def _literal_number(node: object) -> float | None:
+    if isinstance(node, NumberLiteral):
+        return node.val if math.isfinite(node.val) else None
+    if isinstance(node, UnaryMinusOp) and isinstance(node.expr, NumberLiteral):
+        return -node.expr.val if math.isfinite(node.expr.val) else None
+    return None
+
+
+def _direct_static_extrusion(node: ModularCall) -> bool:
+    named = {
+        arg.name.name: arg.expr
+        for arg in node.arguments
+        if isinstance(arg, NamedArgument)
+    }
+    positional = [
+        arg.expr for arg in node.arguments if isinstance(arg, PositionalArgument)
+    ]
+    twist = _literal_number(named["twist"]) if "twist" in named else 0
+    slices = _literal_number(named["slices"]) if "slices" in named else 0
+    if twist is None or slices is None or not all(map(math.isfinite, (twist, slices))):
+        return False
+    center = named.get("center", positional[1] if len(positional) > 1 else None)
+    height = named.get("height", positional[0] if positional else None)
+    if center is not None and not isinstance(center, BooleanLiteral):
+        return False
+    if (
+        isinstance(center, BooleanLiteral)
+        and center.val
+        and _literal_number(height) is None
+    ):
+        return False
+    for name in _SEGMENT_VARIABLES:
+        if name in named:
+            value = _literal_number(named[name])
+            if value is None or not math.isfinite(value):
+                return False
+    if twist and not slices:
+        fn = _literal_number(named.get("$fn"))
+        if fn is None or int(fn) <= 0:
+            return False
+    if "scale" in named:
+        scale = named["scale"]
+        if isinstance(scale, ListComprehension):
+            return all(
+                _literal_number(element) is not None for element in scale.elements
+            )
+        return _literal_number(scale) is not None
+    return True
+
+
+def _segment_module_requirements(
+    nodes: list[object], source_path: Path | None, base_dir: Path | None
+) -> dict[str, set[str]]:
+    # Analyze used files together so separately translated module signatures agree.
+    root = source_path.resolve() if source_path is not None else None
+    files: dict[Path | None, tuple[list[object], Path | None, list[Path]]] = {}
+
+    def load(key: Path | None, contents: list[object], directory: Path | None) -> None:
+        if key in files:
+            return
+        imports: list[Path] = []
+        files[key] = (contents, directory, imports)
+        if directory is None:
+            return
+        for node in contents:
+            if isinstance(node, UseStatement):
+                path = (directory / node.filepath.val).resolve()
+                if path.is_file():
+                    imports.append(path)
+                    used = getASTfromFile(str(path)) or []
+                    _unwrap_commented_names(used)
+                    load(path, used, path.parent)
+
+    load(root, nodes, base_dir)
+    declarations: dict[tuple[Path | None, str], list[ModuleDeclaration]] = {}
+
+    def collect(key: Path | None, contents: Iterable[object]) -> None:
+        for node in contents:
+            if isinstance(node, ModuleDeclaration):
+                declarations.setdefault((key, node.name.name), []).append(node)
+                collect(key, node.children)
+
+    for key, (contents, _, _) in files.items():
+        collect(key, contents)
+
+    visible: dict[Path | None, dict[str, tuple[Path | None, str]]] = {}
+    for key, (_, _, imports) in files.items():
+        names: dict[str, tuple[Path | None, str]] = {}
+        for imported in imports:
+            names.update(
+                (name, (owner, name))
+                for owner, name in declarations
+                if owner == imported
+            )
+        names.update(
+            (name, (owner, name)) for owner, name in declarations if owner == key
+        )
+        visible[key] = names
+
+    requirements = {key: set() for key in declarations}
+    calls: dict[
+        tuple[Path | None, str], list[tuple[tuple[Path | None, str], set[str]]]
+    ] = {key: [] for key in declarations}
+    segment_primitives = {"circle", "sphere", "cylinder", "rotate_extrude"}
+
+    for key, modules in declarations.items():
+
+        def visit(node: object, bound: frozenset[str] = frozenset()) -> None:
+            if isinstance(node, Identifier):
+                if node.name in _SEGMENT_VARIABLES and node.name not in bound:
+                    requirements[key].add(node.name)
+            elif isinstance(node, (Assignment, NamedArgument)):
+                visit(node.expr, bound)
+            elif isinstance(node, ModuleDeclaration):
+                visit(node.parameters, bound)
+            elif isinstance(node, ModularCall):
+                name = node.name.name
+                provided = {
+                    arg.name.name
+                    for arg in node.arguments
+                    if isinstance(arg, NamedArgument)
+                    and arg.name.name in _SEGMENT_VARIABLES
+                }
+                needs_segments = name in segment_primitives
+                if name == "offset":
+                    needs_segments = not any(
+                        isinstance(arg, NamedArgument) and arg.name.name == "delta"
+                        for arg in node.arguments
+                    )
+                if name == "linear_extrude":
+                    needs_segments = any(
+                        isinstance(arg, NamedArgument)
+                        and arg.name.name in {"twist", "slices", "scale"}
+                        for arg in node.arguments
+                    ) and not _direct_static_extrusion(node)
+                if needs_segments:
+                    requirements[key].update(set(_SEGMENT_VARIABLES) - provided - bound)
+                elif name in visible[key[0]]:
+                    calls[key].append((visible[key[0]][name], provided | bound))
+                visit(node.arguments, bound)
+                child_bound = bound
+                if name in {"linear_extrude", "offset", "rotate_extrude"}:
+                    child_bound = bound | provided
+                visit(node.children, child_bound)
+            elif isinstance(node, (list, tuple)):
+                for item in node:
+                    visit(item, bound)
+            elif hasattr(node, "__dict__"):
+                for attribute, value in vars(node).items():
+                    if attribute != "position":
+                        visit(value, bound)
+
+        for module in modules:
+            # Module assignments are emitted before the geometry expressions.
+            assigned: frozenset[str] = frozenset()
+            for child in module.children:
+                if isinstance(child, Assignment):
+                    visit(child.expr, assigned)
+                    if child.name.name in _SEGMENT_VARIABLES:
+                        assigned |= {child.name.name}
+            for child in module.children:
+                if isinstance(child, Assignment):
+                    continue
+                if isinstance(child, FunctionDeclaration):
+                    visit(child.parameters)
+                    visit(child.expr, assigned)
+                elif isinstance(child, ModuleDeclaration):
+                    visit(child.parameters)
+                else:
+                    visit(child, assigned)
+
+    changed = True
+    while changed:
+        changed = False
+        for key, dependencies in calls.items():
+            before = len(requirements[key])
+            for target, provided in dependencies:
+                requirements[key].update(requirements[target] - provided)
+            changed |= len(requirements[key]) != before
+    return {name: requirements[target] for name, target in visible[root].items()}
+
+
 _CENTER_MODULES = frozenset({"cube", "square", "cylinder", "linear_extrude"})
 
 _EXPORT_COMMENT = re.compile(r"\s*export\s+(\S+\.\w+)\s*$", re.I)
@@ -354,6 +539,7 @@ class _Translator:
         self.uses_vec2 = False
         self.helpers: set[str] = set()
         self.module_names: set[str] = set()
+        self.segment_modules: dict[str, set[str]] = {}
         self.geometry_modules: dict[str, ModuleDeclaration] = {}
         self.shadowing_names: set[str] = set()
         self.children_modules: set[str] = set()
@@ -428,6 +614,9 @@ class _Translator:
         for node in nodes:
             if isinstance(node, UseStatement):
                 self.load_used_names(node)
+        self.segment_modules = _segment_module_requirements(
+            nodes, self.source_path, self.base_dir
+        )
         declaration_indices: dict[str, int] = {}
         for index, node in enumerate(nodes):
             if isinstance(node, (FunctionDeclaration, ModuleDeclaration)):
@@ -873,26 +1062,27 @@ class _Translator:
                 "    return None",
             ]
         params = [self.parameters(node.parameters)] if node.parameters else []
+        needed = self.segment_modules.get(node.name.name, set(_SEGMENT_VARIABLES))
         params.extend(
-            [
-                "_scadtopy_special_fn=None",
-                "_scadtopy_special_fa=None",
-                "_scadtopy_special_fs=None",
-            ]
+            f"_scadtopy_special_{name[1:]}=None"
+            for name in _SEGMENT_VARIABLES
+            if name in needed
         )
         if _uses_children(node.children):
             params.append("_children=()")
         lines = [f"def {self.py_name(node.name.name)}({', '.join(params)}):"]
         enclosing_assert_definitions = self.assert_definitions
         self.assert_definitions = []
-        assignments: list[str] = [
-            "    if _scadtopy_special_fn is None:",
-            "        _scadtopy_special_fn = _scadtopy_default_fn",
-            "    if _scadtopy_special_fa is None:",
-            "        _scadtopy_special_fa = _scadtopy_default_fa",
-            "    if _scadtopy_special_fs is None:",
-            "        _scadtopy_special_fs = _scadtopy_default_fs",
-        ]
+        assignments: list[str] = []
+        for name in _SEGMENT_VARIABLES:
+            if name in needed:
+                suffix = name[1:]
+                assignments.extend(
+                    [
+                        f"    if _scadtopy_special_{suffix} is None:",
+                        f"        _scadtopy_special_{suffix} = _scadtopy_default_{suffix}",
+                    ]
+                )
         previous_in_module = self.in_module
         self.in_module = True
         geometry: list[tuple[bool, str]] = []
@@ -1603,7 +1793,7 @@ class _Translator:
                 return "_scadtopy_children(_children)"
             return f"_scadtopy_children(_children, {self.expression(index)})"
         if name in self.module_names:
-            arguments = self.module_call_arguments(node.arguments)
+            arguments = self.module_call_arguments(name, node.arguments)
             if children and name in self.children_modules:
                 arguments.append(f"_children=[{', '.join(children)}]")
             return f"{self.py_name(name)}({', '.join(arguments)})"
@@ -1992,7 +2182,9 @@ class _Translator:
             fs_override if fs_override is not None else fs,
         )
 
-    def module_call_arguments(self, arguments: list[object]) -> list[str]:
+    def module_call_arguments(
+        self, module_name: str, arguments: list[object]
+    ) -> list[str]:
         special_names = {
             "$fn": "_scadtopy_special_fn",
             "$fa": "_scadtopy_special_fa",
@@ -2000,19 +2192,25 @@ class _Translator:
         }
         rendered: list[str] = []
         provided: set[str] = set()
+        needed = self.segment_modules.get(module_name, set(_SEGMENT_VARIABLES))
         for argument in arguments:
             if isinstance(argument, PositionalArgument):
                 rendered.append(self.expression(argument.expr))
             elif isinstance(argument, NamedArgument):
                 name = argument.name.name
                 if name in special_names:
-                    rendered.append(
-                        f"{special_names[name]}="
-                        f"{'int(' if name == '$fn' else ''}"
-                        f"{self.expression(argument.expr)}"
-                        f"{')' if name == '$fn' else ''}"
-                    )
-                    provided.add(name)
+                    value = self.expression(argument.expr)
+                    if name == "$fn":
+                        value = f"int({value})"
+                    if name in needed:
+                        rendered.append(f"{special_names[name]}={value}")
+                        provided.add(name)
+                    elif not (
+                        isinstance(argument.expr, NumberLiteral)
+                        and math.isfinite(argument.expr.val)
+                    ):
+                        # Preserve evaluation and its order without adding a parameter.
+                        rendered.append(f"**({value}, {{}})[1]")
                 else:
                     rendered.append(f"{name}={self.expression(argument.expr)}")
             else:
@@ -2027,7 +2225,7 @@ class _Translator:
         rendered.extend(
             f"{special_names[name]}={value}"
             for name, value in inherited.items()
-            if name not in provided
+            if name in needed and name not in provided
         )
         return rendered
 

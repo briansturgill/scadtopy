@@ -41,6 +41,8 @@ Translation emits source-filename and line-number warnings for `use <file.scad>`
 
 Correction to the overview above: top-level `$fn`, `$fa`, and `$fs` assignments set the translated segment settings without changing Piecad's global configuration. `$fn` defaults to OpenSCAD's `0`, so segment counts are calculated from the radius, `$fa`, and `$fs` unless overridden. Per-call overrides are passed through, including through user modules. `linear_extrude()` forwards these settings to its child profile and uses them to determine the twist divisions when `slices` is omitted.
 
+User modules receive only the segment settings needed by their bodies or the modules they call.
+
 Transformed `linear_extrude()` calls use `extrude_transforming()` directly when their arguments can be adapted statically; other cases use a generated runtime adapter.
 
 When a top-level function or module is called before its declaration, declarations from that source point onward are emitted before the first forward call, matching OpenSCAD's order-independent declaration behavior. Statements before that call, including assignments used by module parameter defaults, retain their order.

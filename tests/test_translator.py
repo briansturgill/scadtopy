@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import io
+import sys
 import tempfile
+import types
 import unittest
 import warnings
 from contextlib import redirect_stdout
@@ -59,19 +61,121 @@ class TranslatorTests(unittest.TestCase):
             """)
 
         self.assertIn("size = 8.0", generated)
-        self.assertIn(
-            "def box(width=size, _scadtopy_special_fn=None, "
-            "_scadtopy_special_fa=None, _scadtopy_special_fs=None):",
-            generated,
-        )
+        self.assertIn("def box(width=size):", generated)
         self.assertIn("return cube([width, width, width])", generated)
+        self.assertIn("box(12.0)", generated)
+        compile(generated, "<generated>", "exec")
+
+    def test_module_segment_parameters_are_only_added_when_needed(self) -> None:
+        generated = self.translate("""
+            module box(size=2) cube(size);
+            module width() cube($fn);
+            module wrapper() box();
+            box();
+            width($fn=4);
+            wrapper();
+            """)
+
+        self.assertIn("def box(size=2.0):", generated)
+        self.assertIn("def width(_scadtopy_special_fn=None):", generated)
+        self.assertIn("def wrapper():", generated)
+        self.assertIn("_parts.append(box())", generated)
+        self.assertIn("_parts.append(wrapper())", generated)
+        self.assertNotIn("_scadtopy_special_fa", generated)
+        self.assertNotIn("_scadtopy_special_fs", generated)
+        namespace: dict[str, object] = {}
+        exec(generated, namespace)
+        self.assertEqual(namespace["_parts"][1].bounding_box(), (0, 0, 0, 4, 4, 4))
+
+    def test_module_segment_requirements_propagate_through_recursive_calls(
+        self,
+    ) -> None:
+        generated = self.translate("""
+            module wrapper(n) {
+                if (n > 0) wrapper(n - 1);
+                else part();
+            }
+            module part() cube($fn);
+            wrapper(2, $fn=7);
+            """)
+
+        self.assertIn("def wrapper(n, _scadtopy_special_fn=None):", generated)
+        self.assertNotIn("_scadtopy_special_fa", generated)
+        self.assertNotIn("_scadtopy_special_fs", generated)
+        namespace: dict[str, object] = {}
+        exec(generated, namespace)
+        self.assertEqual(namespace["_parts"][0].bounding_box(), (0, 0, 0, 7, 7, 7))
+
+    def test_module_extrude_with_fixed_segments_needs_no_inherited_settings(
+        self,
+    ) -> None:
+        generated = self.translate("""
+            module profile() circle(2);
+            module part() {
+                linear_extrude(height=10, twist=90, slices=4, scale=2,
+                               $fn=8, $fa=6, $fs=1) profile();
+            }
+            part();
+            """)
+
+        self.assertIn("def part():", generated)
+        self.assertIn("_parts.append(part())", generated)
+        namespace: dict[str, object] = {}
+        exec(generated, namespace)
+        self.assertFalse(namespace["_parts"][0].is_empty())
+
+    def test_module_segment_reference_in_nested_function(self) -> None:
+        generated = self.translate("""
+            module part() {
+                function width() = $fn;
+                cube(width());
+            }
+            part($fn=6);
+            """)
+
+        self.assertIn("def part(_scadtopy_special_fn=None):", generated)
+        self.assertNotIn("_scadtopy_special_fa", generated)
+        namespace: dict[str, object] = {}
+        exec(generated, namespace)
+        self.assertEqual(namespace["_parts"][0].bounding_box(), (0, 0, 0, 6, 6, 6))
+
+    def test_module_primitive_override_needs_only_remaining_settings(self) -> None:
+        generated = self.translate("module part() sphere(1, $fn=8); part();")
+
         self.assertIn(
-            "box(12.0, _scadtopy_special_fn=_scadtopy_default_fn, "
-            "_scadtopy_special_fa=_scadtopy_default_fa, "
-            "_scadtopy_special_fs=_scadtopy_default_fs)",
+            "def part(_scadtopy_special_fa=None, _scadtopy_special_fs=None):",
             generated,
         )
-        compile(generated, "<generated>", "exec")
+        self.assertNotIn("_scadtopy_special_fn", generated)
+        namespace: dict[str, object] = {}
+        exec(generated, namespace)
+        self.assertFalse(namespace["_parts"][0].is_empty())
+
+    def test_module_local_segment_assignment_can_read_inherited_value(self) -> None:
+        generated = self.translate(
+            "module part() { $fn=$fn+2; cube($fn); } part($fn=3);"
+        )
+
+        self.assertIn("def part(_scadtopy_special_fn=None):", generated)
+        self.assertNotIn("_scadtopy_special_fa", generated)
+        namespace: dict[str, object] = {}
+        exec(generated, namespace)
+        self.assertEqual(namespace["_parts"][0].bounding_box(), (0, 0, 0, 5, 5, 5))
+
+    def test_unused_module_segment_argument_preserves_evaluation_order(self) -> None:
+        generated = self.translate("""
+            function value(label, result) = echo(label) result;
+            module box(size) cube(size);
+            box(size=value("size", 2), $fn=value("fn", 8));
+            """)
+
+        self.assertIn("def box(size):", generated)
+        output = io.StringIO()
+        namespace: dict[str, object] = {}
+        with redirect_stdout(output):
+            exec(generated, namespace)
+        self.assertEqual(output.getvalue(), "size\nfn\n")
+        self.assertEqual(namespace["_parts"][0].bounding_box(), (0, 0, 0, 2, 2, 2))
 
     def test_maps_diameters_and_centered_cylinders(self) -> None:
         circle = self.translate("circle(d=10, $fn=24);")
@@ -209,11 +313,7 @@ class TranslatorTests(unittest.TestCase):
             "module lowres() { $fn=0; $fa=6; $fs=1; sphere(5); } lowres();"
         )
 
-        self.assertIn(
-            "def lowres(_scadtopy_special_fn=None, _scadtopy_special_fa=None, "
-            "_scadtopy_special_fs=None):",
-            generated,
-        )
+        self.assertIn("def lowres():", generated)
         self.assertIn("    _scadtopy_special_fn = int(0.0)", generated)
         self.assertIn("    _scadtopy_special_fa = 6.0", generated)
         self.assertIn("    _scadtopy_special_fs = 1.0", generated)
@@ -773,11 +873,7 @@ class TranslatorTests(unittest.TestCase):
             translate([0,40,0]) first() { cube(2); sphere(5); }
             """)
 
-        self.assertIn(
-            "def repeated(count=3.0, _scadtopy_special_fn=None, "
-            "_scadtopy_special_fa=None, _scadtopy_special_fs=None, _children=()):",
-            generated,
-        )
+        self.assertIn("def repeated(count=3.0, _children=()):", generated)
         self.assertIn("_children=[", generated)
         self.assertNotIn("children() substitution", generated)
         namespace: dict[str, object] = {}
@@ -1208,12 +1304,40 @@ class TranslatorTests(unittest.TestCase):
             generated = translate_file(main_file)
 
         self.assertIn("from lib import *", generated)
-        self.assertIn(
-            "peg(_scadtopy_special_fn=_scadtopy_default_fn, "
-            "_scadtopy_special_fa=_scadtopy_default_fa, "
-            "_scadtopy_special_fs=_scadtopy_default_fs)",
-            generated,
-        )
+        self.assertIn("_parts.append(peg())", generated)
+
+    def test_used_modules_propagate_only_their_required_segment_settings(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "leaf.scad").write_text(
+                "module leaf() cube($fn);", encoding="utf-8"
+            )
+            (root / "lib.scad").write_text(
+                "use <leaf.scad>\nmodule peg() leaf();", encoding="utf-8"
+            )
+            (root / "main.scad").write_text(
+                "use <lib.scad>\npeg($fn=5);", encoding="utf-8"
+            )
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                leaf = translate_file(root / "leaf.scad")
+                lib = translate_file(root / "lib.scad")
+                main = translate_file(root / "main.scad")
+
+        self.assertIn("def leaf(_scadtopy_special_fn=None):", leaf)
+        self.assertIn("def peg(_scadtopy_special_fn=None):", lib)
+        self.assertIn("peg(_scadtopy_special_fn=int(5.0))", main)
+        for generated in (leaf, lib, main):
+            self.assertNotIn("_scadtopy_special_fa", generated)
+            self.assertNotIn("_scadtopy_special_fs", generated)
+        leaf_module = types.ModuleType("leaf")
+        lib_module = types.ModuleType("lib")
+        with patch.dict(sys.modules, {"leaf": leaf_module, "lib": lib_module}):
+            exec(leaf, leaf_module.__dict__)
+            exec(lib, lib_module.__dict__)
+            namespace: dict[str, object] = {}
+            exec(main, namespace)
+        self.assertEqual(namespace["_parts"][0].bounding_box(), (0, 0, 0, 5, 5, 5))
 
     def test_warns_about_use_and_import_paths_with_source_filename(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
