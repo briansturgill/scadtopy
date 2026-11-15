@@ -31,6 +31,10 @@ Generated `translate()` calls inspect the returned Piecad object at runtime: `Ob
 
 Function values can be called through expressions, including functions selected from lists, returned by other calls, or chosen conditionally.
 
+OpenSCAD ranges use Piecad `frange`, with inclusive endpoints and list results.
+
+OpenSCAD assertions translate to Python `assert` statements, which are disabled when Python runs with `-O` or `-OO`.
+
 Translation emits source-filename and line-number warnings for `use <file.scad>` (the used file must be translated separately) and supported `import("file")` paths (passed unchanged to Piecad and resolved from the Python process working directory).
 
 Correction to the overview above: top-level `$fn`, `$fa`, and `$fs` assignments map to Piecad's segment-count, minimum-angle, and minimum-segment-length configuration. Circular primitives calculate their segment count from the radius and active settings; per-call overrides are passed through, including through user modules. `linear_extrude()` forwards these settings to its child profile and uses them to determine the twist divisions when `slices` is omitted.

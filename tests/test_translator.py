@@ -271,10 +271,19 @@ class TranslatorTests(unittest.TestCase):
             ascending = [0:2:6];
             descending = [3:-1:0];
             fractional = [0:0.1:0.3];
+            fractional_descending = [0:-0.1:-0.3];
+            incomplete = [0:2:5];
+            incomplete_descending = [5:-2:0];
+            singleton = [2:0.5:2];
             empty = [5:0];
+            empty_descending = [0:-1:5];
             """)
 
-        self.assertIn("frange(1.0, 1.0, 3.0)", generated)
+        self.assertIn(
+            "frange(1.0, 3.0, 1.0, inclusive=True)",
+            generated,
+        )
+        self.assertNotIn("_scadtopy_start", generated)
         self.assertNotIn("_scadtopy_range", generated)
         namespace: dict[str, object] = {}
         exec(generated, namespace)
@@ -282,7 +291,38 @@ class TranslatorTests(unittest.TestCase):
         self.assertEqual(namespace["ascending"], [0.0, 2.0, 4.0, 6.0])
         self.assertEqual(namespace["descending"], [3.0, 2.0, 1.0, 0.0])
         self.assertEqual(namespace["fractional"], [0.0, 0.1, 0.2, 0.30000000000000004])
+        self.assertEqual(
+            namespace["fractional_descending"],
+            [0.0, -0.1, -0.2, -0.30000000000000004],
+        )
+        self.assertEqual(namespace["incomplete"], [0.0, 2.0, 4.0])
+        self.assertEqual(namespace["incomplete_descending"], [5.0, 3.0, 1.0])
+        self.assertEqual(namespace["singleton"], [2.0])
         self.assertEqual(namespace["empty"], [])
+        self.assertEqual(namespace["empty_descending"], [])
+
+    def test_range_rejects_zero_step(self) -> None:
+        generated = self.translate("values = [1:0:3];")
+        with self.assertRaises(ValueError):
+            exec(generated, {})
+
+    def test_range_with_tiny_negative_distance_is_empty(self) -> None:
+        generated = self.translate("function values(a, step, b) = [a:step:b];")
+        namespace: dict[str, object] = {}
+        exec(generated, namespace)
+        self.assertEqual(namespace["values"](5e-324, 1, 0), [])
+
+    def test_range_arguments_are_evaluated_once_in_python_order(self) -> None:
+        generated = self.translate("""
+            function value(x) = echo(x) x;
+            values = [value(0):value(2):value(6)];
+            """)
+        output = io.StringIO()
+        namespace: dict[str, object] = {}
+        with redirect_stdout(output):
+            exec(generated, namespace)
+        self.assertEqual(output.getvalue(), "ECHO: 0\nECHO: 6\nECHO: 2\n")
+        self.assertEqual(namespace["values"], [0, 2, 4, 6])
 
     def test_translates_functions_let_assert_and_function_literals(self) -> None:
         generated = self.translate("""
@@ -324,8 +364,107 @@ class TranslatorTests(unittest.TestCase):
     def test_expression_assertion_is_lazy_and_fails_explicitly(self) -> None:
         generated = self.translate("result = assert(false) missing_function();")
 
+        self.assertIn("assert False", generated)
+        self.assertNotIn("_scadtopy_assert(", generated)
         with self.assertRaises(AssertionError):
             exec(generated, {})
+
+    def test_assertions_use_python_statements_in_modules_and_expressions(self) -> None:
+        generated = self.translate("""
+            assert(true, "top");
+            function checked(x) = let(y = x + 1) assert(y > 0, "bad") y;
+            function direct(x) = assert(x > 0, "direct") x;
+            values = [for (i = [1, 2, 3]) assert(i > 0) i * 2];
+            callback = function(x) assert(x > 0) x;
+            module shape() {
+                assert(true, "module");
+                assert(true) cube(2);
+            }
+            shape();
+            """)
+
+        self.assertNotIn("def _scadtopy_assert(", generated)
+        self.assertIn("assert True, 'top'", generated)
+        self.assertIn("assert True, 'module'", generated)
+        self.assertIn("def direct(x):\n    assert x > 0.0, 'direct'", generated)
+        namespace: dict[str, object] = {}
+        exec(generated, namespace)
+        self.assertEqual(namespace["checked"](2), 3)
+        self.assertEqual(namespace["values"], [2, 4, 6])
+        self.assertEqual(namespace["callback"](4), 4)
+        with self.assertRaisesRegex(AssertionError, "bad"):
+            namespace["checked"](-2)
+        with self.assertRaisesRegex(AssertionError, "direct"):
+            namespace["direct"](0)
+        with self.assertRaises(AssertionError):
+            namespace["callback"](0)
+        self.assertEqual(namespace["_parts"][0].bounding_box(), (0, 0, 0, 2, 2, 2))
+
+    def test_assertions_only_evaluate_selected_branches_and_failure_messages(
+        self,
+    ) -> None:
+        generated = self.translate("""
+            result = true ? 5 : assert(false) missing_function();
+            checked = assert(true, missing_function()) 7;
+            """)
+        namespace: dict[str, object] = {}
+        exec(generated, namespace)
+        self.assertEqual(namespace["result"], 5)
+        self.assertEqual(namespace["checked"], 7)
+
+    def test_nested_geometry_assertions_preserve_loop_scope_and_order(self) -> None:
+        generated = self.translate("""
+            module shape() {
+                for (i = [1, 2]) {
+                    assert(i > 0, "bad");
+                    cube(i);
+                    assert(i < 3, "bad");
+                }
+            }
+            shape();
+            """)
+        namespace: dict[str, object] = {}
+        exec(generated, namespace)
+        self.assertEqual(namespace["_parts"][0].bounding_box(), (0, 0, 0, 2, 2, 2))
+
+    def test_module_assertion_runs_between_geometry_calls(self) -> None:
+        from piecad import cube
+
+        generated = self.translate("""
+            module shape() {
+                cube(1);
+                assert(false, "stop");
+                cube(2);
+            }
+            shape();
+            """)
+        with patch("piecad.cube", wraps=cube) as cube_call:
+            with self.assertRaisesRegex(AssertionError, "stop"):
+                exec(generated, {})
+        cube_call.assert_called_once_with(1.0)
+
+    def test_nested_assertions_keep_local_bindings(self) -> None:
+        generated = self.translate("""
+            function check(offset) =
+                [for (i = [1, 2]) let(x = i + offset)
+                    assert(x > 0) assert(x < 10) x];
+            callback = function(x) let(y = x + 1) assert(y > 0) y;
+            """)
+        namespace: dict[str, object] = {}
+        exec(generated, namespace)
+        self.assertEqual(namespace["check"](2), [3, 4])
+        self.assertEqual(namespace["callback"](2), 3)
+        with self.assertRaises(AssertionError):
+            namespace["check"](-2)
+        with self.assertRaises(AssertionError):
+            namespace["check"](9)
+
+    def test_module_assertion_with_unsupported_special_variable_is_reported(
+        self,
+    ) -> None:
+        generated = self.translate("module shape() { assert($t > 0); cube(1); }")
+        self.assertIn("# UNSUPPORTED: $t are not translated", generated)
+        compile(generated, "<generated-assert>", "exec")
 
     def test_expression_echo_prints_arguments_and_returns_body_value(self) -> None:
         generated = self.translate('result = echo("number", 3, status=true) 7;')

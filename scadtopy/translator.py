@@ -5,8 +5,9 @@ from __future__ import annotations
 import ast
 import re
 import warnings
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, Iterator
 
 from openscad_parser.ast import getASTfromFile
 from openscad_parser.ast.nodes import (
@@ -57,6 +58,7 @@ from openscad_parser.ast.nodes import (
     UndefinedLiteral,
     UseStatement,
 )
+
 
 class TranslationError(ValueError):
     """Raised for malformed input or invalid arguments to supported constructs."""
@@ -347,7 +349,9 @@ class _Translator:
         self.uses_math = False
         self.segment_overrides: tuple[str, str, str] | None = None
         self.in_module = False
-        self.uses_assert_helper = False
+        self.assert_definitions: list[str] = []
+        self.assert_counter = 0
+        self.expression_bindings: list[str] = []
         self.uses_echo_helper = False
         self.fixmes: list[str] = []
 
@@ -366,7 +370,9 @@ class _Translator:
         self.uses_math = False
         self.segment_overrides = None
         self.in_module = False
-        self.uses_assert_helper = False
+        self.assert_definitions = []
+        self.assert_counter = 0
+        self.expression_bindings = []
         self.uses_echo_helper = False
         self.fixmes = []
         self.uses_children_helper = False
@@ -430,7 +436,9 @@ class _Translator:
                     )
                     last_statement_is_model = False
                     continue
-                value = self.expression(node.expr)
+                assertions, expression = self.assertions_before_expression(node.expr)
+                statements.extend(assertions)
+                value = self.expression(expression)
                 if node.name.name == "$fn":
                     statements.append(f"_scadtopy_default_fn = int({value})")
                 elif node.name.name == "$fa":
@@ -466,7 +474,7 @@ class _Translator:
                     statements.append(self.module_call(node))
                     last_statement_is_model = False
                 elif isinstance(node, ModularAssert) and not node.children:
-                    statements.append(self.module_call(node))
+                    statements.append(self.assert_statement(node))
                     last_statement_is_model = False
                 else:
                     saw_model = True
@@ -535,13 +543,6 @@ class _Translator:
             prefix = "import math\n\n"
         if "rands" in self.helpers:
             prefix += "import random\n\n"
-        if self.uses_assert_helper:
-            prefix += (
-                "def _scadtopy_assert(condition, message, value):\n"
-                "    if not condition:\n"
-                "        raise AssertionError(message)\n"
-                "    return value()\n\n"
-            )
         if self.uses_echo_helper:
             prefix += (
                 "import json\n\n"
@@ -573,6 +574,8 @@ class _Translator:
         if self.uses_vec2:
             prefix += "from piecad.lin_math import Vec2\n"
         prefix += "\n"
+        if self.assert_definitions:
+            prefix += "\n\n".join(self.assert_definitions) + "\n\n"
         if self.uses_segments_helper or self.uses_linear_extrude_helper:
             prefix += (
                 "def _scadtopy_calculate_segments(radius, fn, fa, fs):\n"
@@ -860,6 +863,8 @@ class _Translator:
         if _uses_children(node.children):
             params.append("_children=()")
         lines = [f"def {self.py_name(node.name.name)}({', '.join(params)}):"]
+        enclosing_assert_definitions = self.assert_definitions
+        self.assert_definitions = []
         assignments: list[str] = [
             "    if _scadtopy_special_fn is None:",
             "        _scadtopy_special_fn = _scadtopy_default_fn",
@@ -870,7 +875,7 @@ class _Translator:
         ]
         previous_in_module = self.in_module
         self.in_module = True
-        geometry: list[str] = []
+        geometry: list[tuple[bool, str]] = []
         for child in node.children:
             if isinstance(child, Assignment):
                 unsupported = _unsupported_special_variables(child.expr)
@@ -880,7 +885,9 @@ class _Translator:
                         "are not translated"
                     )
                     continue
-                value = self.expression(child.expr)
+                assertions, expression = self.assertions_before_expression(child.expr)
+                assignments.extend(f"    {assertion}" for assertion in assertions)
+                value = self.expression(expression)
                 if child.name.name == "$fn":
                     assignments.append(f"    _scadtopy_special_fn = int({value})")
                 elif child.name.name == "$fa":
@@ -895,6 +902,15 @@ class _Translator:
                     assignments.append(f"    {child.name.name} = {value}")
             elif isinstance(child, ModularEcho) and not child.children:
                 assignments.append(f"    {self.module_call(child)}")
+            elif isinstance(child, ModularAssert) and not child.children:
+                unsupported = _unsupported_special_variables(child)
+                if unsupported:
+                    assignments.append(
+                        f"    # UNSUPPORTED: {', '.join(sorted(unsupported))} "
+                        "are not translated"
+                    )
+                    continue
+                geometry.append((True, self.assert_statement(child)))
             elif isinstance(child, ModuleInstantiation):
                 unsupported = _unsupported_special_variables(child)
                 if unsupported:
@@ -905,7 +921,7 @@ class _Translator:
                     continue
                 translated = self.module_call(child)
                 if translated != "None":
-                    geometry.append(translated)
+                    geometry.append((False, translated))
             elif isinstance(child, FunctionDeclaration):
                 lines.extend(f"    {line}" for line in self.function_declaration(child))
             elif isinstance(child, ModuleDeclaration):
@@ -920,13 +936,29 @@ class _Translator:
                 )
 
         self.in_module = previous_in_module
+        lines[1:1] = [
+            f"    {line}"
+            for definition in self.assert_definitions
+            for line in definition.splitlines()
+        ]
+        self.assert_definitions = enclosing_assert_definitions
         if assignments:
             lines.extend(assignments)
         if geometry:
-            result = (
-                geometry[0] if len(geometry) == 1 else f"union({', '.join(geometry)})"
-            )
-            lines.append(f"    return {result}")
+            if any(is_assert for is_assert, _ in geometry):
+                parts = []
+                for is_assert, translated in geometry:
+                    if is_assert:
+                        lines.append(f"    {translated}")
+                    else:
+                        name = f"_scadtopy_geometry_{len(parts)}"
+                        lines.append(f"    {name} = {translated}")
+                        parts.append(name)
+                lines.append(f"    return {self.combine(parts) if parts else 'None'}")
+            else:
+                lines.append(
+                    f"    return {self.combine([value for _, value in geometry])}"
+                )
         else:
             lines.append("    return None")
         return lines
@@ -941,9 +973,21 @@ class _Translator:
                 "    return None",
             ]
         params = self.parameters(node.parameters)
+        enclosing_assert_definitions = self.assert_definitions
+        self.assert_definitions = []
+        assertions, expression = self.assertions_before_expression(node.expr)
+        value = self.expression(expression)
+        definitions = self.assert_definitions
+        self.assert_definitions = enclosing_assert_definitions
         return [
             f"def {self.py_name(node.name.name)}({params}):",
-            f"    return {self.expression(node.expr)}",
+            *(
+                f"    {line}"
+                for definition in definitions
+                for line in definition.splitlines()
+            ),
+            *(f"    {assertion}" for assertion in assertions),
+            f"    return {value}",
         ]
 
     def parameters(self, parameters: list[object]) -> str:
@@ -994,6 +1038,43 @@ class _Translator:
         )
         return condition_value, message_value
 
+    def assert_statement(self, node: AssertOp | ModularAssert) -> str:
+        condition, message = self.assert_values(node.arguments, node)
+        return f"assert {condition}, {message}"
+
+    def assertions_before_expression(self, node: object) -> tuple[list[str], object]:
+        assertions = []
+        while isinstance(node, AssertOp):
+            assertions.append(self.assert_statement(node))
+            node = node.body
+        return assertions, node
+
+    @contextmanager
+    def bind_expression_names(self, names: Iterable[str]) -> Iterator[None]:
+        previous_length = len(self.expression_bindings)
+        self.expression_bindings.extend(names)
+        try:
+            yield
+        finally:
+            del self.expression_bindings[previous_length:]
+
+    def assert_expression(self, node: AssertOp | ModularAssert) -> str:
+        self.assert_counter += 1
+        name = f"_scadtopy_assert_{self.assert_counter}"
+        bindings = list(dict.fromkeys(self.expression_bindings))
+        condition, message = self.assert_values(node.arguments, node)
+        value = (
+            self.expression(node.body)
+            if isinstance(node, AssertOp)
+            else self.module_group(node.children)
+        )
+        self.assert_definitions.append(
+            f"def {name}({', '.join(bindings)}):\n"
+            f"    assert {condition}, {message}\n"
+            f"    return {value}"
+        )
+        return f"{name}({', '.join(bindings)})"
+
     def echo_expression(self, arguments: list[object], result: str) -> str:
         self.uses_echo_helper = True
         values = []
@@ -1013,17 +1094,34 @@ class _Translator:
             return nodes
         return [nodes]
 
-    def module_group(self, nodes: object) -> str:
+    def module_children(self, nodes: object) -> list[str]:
         geometries: list[str] = []
+        assertions: list[str] = []
         for node in self.module_list(nodes):
             if isinstance(node, (CommentLine, CommentSpan, BlankLine)):
                 continue
             if isinstance(node, ModularModifierDisable):
                 self.module_call(node)
                 continue
+            if isinstance(node, ModularAssert) and not node.children:
+                assertions.append(self.module_call(node))
+                continue
             geometry = self.module_call(node)
             if geometry != "None":
+                if assertions:
+                    geometry = f"({', '.join(assertions)}, {geometry})[-1]"
+                    assertions = []
                 geometries.append(geometry)
+        if assertions:
+            if geometries:
+                geometry = geometries.pop()
+                geometries.append(f"({geometry}, {', '.join(assertions)})[0]")
+            else:
+                geometries.append(f"({', '.join(assertions)}, None)[-1]")
+        return geometries
+
+    def module_group(self, nodes: object) -> str:
+        geometries = self.module_children(nodes)
         if not geometries:
             return "None"
         return self.combine(geometries)
@@ -1031,11 +1129,17 @@ class _Translator:
     def module_loop(
         self, assignments: list[Assignment], body: object, operation: str = "union"
     ) -> str:
-        value = self.module_group(body)
-        clauses = " ".join(
-            f"for {assignment.name.name} in {self.expression(assignment.expr)}"
-            for assignment in assignments
-        )
+        names: list[str] = []
+        clauses = []
+        for assignment in assignments:
+            with self.bind_expression_names(names):
+                clauses.append(
+                    f"for {assignment.name.name} in {self.expression(assignment.expr)}"
+                )
+            names.append(assignment.name.name)
+        with self.bind_expression_names(names):
+            value = self.module_group(body)
+        clauses = " ".join(clauses)
         return f"{operation}(*[{value} {clauses}])"
 
     def module_call(self, node: object) -> str:
@@ -1047,7 +1151,8 @@ class _Translator:
         if isinstance(node, ModularIntersectionFor):
             return self.module_loop(node.assignments, node.body, "intersect")
         if isinstance(node, ModularLet):
-            body = self.module_group(node.children)
+            with self.bind_expression_names(a.name.name for a in node.assignments):
+                body = self.module_group(node.children)
             return self.let_expression(node.assignments, body)
         if isinstance(node, ModularIf):
             return f"({self.module_group(node.true_branch)} if {self.expression(node.condition)} else None)"
@@ -1062,12 +1167,7 @@ class _Translator:
                 node.arguments, self.module_group(node.children)
             )
         if isinstance(node, ModularAssert):
-            self.uses_assert_helper = True
-            condition, message = self.assert_values(node.arguments, node)
-            return (
-                f"_scadtopy_assert({condition}, {message}, "
-                f"lambda: {self.module_group(node.children)})"
-            )
+            return self.assert_expression(node)
         if isinstance(node, ModularModifierShowOnly):
             line = getattr(getattr(node, "position", None), "line", None)
             raise TranslationError(
@@ -1102,7 +1202,7 @@ class _Translator:
             if not isinstance(child, (CommentLine, CommentSpan, BlankLine))
         ]
         try:
-            children = [self.module_call(child) for child in source_children]
+            children = self.module_children(source_children)
         finally:
             self.segment_overrides = previous_segment_overrides
         if source_children and all(child == "None" for child in children):
@@ -1841,11 +1941,11 @@ class _Translator:
             self.fixmes.append(fixme)
 
     def let_expression(self, assignments: list[Assignment], body: str) -> str:
-        for assignment in reversed(assignments):
-            body = (
-                f"(lambda {assignment.name.name}: {body})"
-                f"({self.expression(assignment.expr)})"
-            )
+        for index in reversed(range(len(assignments))):
+            assignment = assignments[index]
+            with self.bind_expression_names(a.name.name for a in assignments[:index]):
+                value = self.expression(assignment.expr)
+            body = f"(lambda {assignment.name.name}: {body})" f"({value})"
         return body
 
     def list_comprehension(self, node: ListComprehension) -> str:
@@ -1878,11 +1978,15 @@ class _Translator:
     def vector_segment(self, element: object, clauses: list[str] | None = None) -> str:
         clauses = list(clauses or [])
         if isinstance(element, ListCompFor):
-            clauses.extend(
-                f"for {assignment.name.name} in {self.expression(assignment.expr)}"
-                for assignment in element.assignments
-            )
-            return self.vector_segment(element.body, clauses)
+            names: list[str] = []
+            for assignment in element.assignments:
+                with self.bind_expression_names(names):
+                    clauses.append(
+                        f"for {assignment.name.name} in {self.expression(assignment.expr)}"
+                    )
+                names.append(assignment.name.name)
+            with self.bind_expression_names(names):
+                return self.vector_segment(element.body, clauses)
         if isinstance(element, ListCompIf):
             if not any(clause.startswith("for ") for clause in clauses):
                 clauses.insert(0, "for _ in [None]")
@@ -1896,7 +2000,8 @@ class _Translator:
             )
             return f"[{value} {' '.join(clauses)}]".rstrip()
         if isinstance(element, ListCompLet):
-            value = self.vector_segment(element.body, clauses)
+            with self.bind_expression_names(a.name.name for a in element.assignments):
+                value = self.vector_segment(element.body, clauses)
             return self.let_expression(element.assignments, value)
         if isinstance(element, ListCompEach):
             value = self.vector_element_value(element.body)
@@ -1948,22 +2053,23 @@ class _Translator:
             return "None"
         if isinstance(node, RangeLiteral):
             return (
-                f"frange({self.expression(node.start)}, "
-                f"{self.expression(node.step)}, {self.expression(node.end)})"
+                f"list(frange({self.expression(node.start)}, "
+                f"{self.expression(node.end)}, {self.expression(node.step)}, "
+                "inclusive=True))"
             )
         if isinstance(node, LetOp):
-            return self.let_expression(node.assignments, self.expression(node.body))
+            with self.bind_expression_names(a.name.name for a in node.assignments):
+                body = self.expression(node.body)
+            return self.let_expression(node.assignments, body)
         if isinstance(node, EchoOp):
             return self.echo_expression(node.arguments, self.expression(node.body))
         if isinstance(node, AssertOp):
-            self.uses_assert_helper = True
-            condition, message = self.assert_values(node.arguments, node)
-            return (
-                f"_scadtopy_assert({condition}, {message}, "
-                f"lambda: {self.expression(node.body)})"
-            )
+            return self.assert_expression(node)
         if isinstance(node, FunctionLiteral):
-            return f"lambda {self.parameters(node.parameters)}: {self.expression(node.body)}"
+            parameters = self.parameters(node.parameters)
+            with self.bind_expression_names(p.name.name for p in node.parameters):
+                body = self.expression(node.body)
+            return f"lambda {parameters}: {body}"
         if isinstance(node, RenderExpression):
             return self.module_group(node.children)
         if isinstance(node, ListComprehension):
