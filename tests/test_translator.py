@@ -943,27 +943,87 @@ class TranslatorTests(unittest.TestCase):
 
     def test_translates_twisted_linear_extrude_and_rotate_extrude(self) -> None:
         generated = self.translate("""
-            linear_extrude(height=10, twist=90, slices=10, scale=2) square(4, center=true);
+            linear_extrude(height=10, twist=90, slices=10, scale=2) square([8, 2], center=true);
+            linear_extrude(height=10, twist=-90, slices=10, scale=2) square([8, 2], center=true);
             translate([50,0,0]) rotate_extrude(angle=270) translate([15,0,0]) circle(2);
             translate([0,50,0]) rotate_extrude() translate([5,0]) circle(1);
             """)
 
         self.assertNotIn("FIXME", generated)
+        self.assertNotIn("_scadtopy_linear_extrude", generated)
+        self.assertIn(
+            "extrude_transforming(rectangle([8.0, 2.0], center=True)"
+            ".mirror((True, False)), 10.0, 10, 90.0, (2.0, 2.0))"
+            ".mirror((True, False, False))",
+            generated,
+        )
+        self.assertIn(
+            "extrude_transforming(rectangle([8.0, 2.0], center=True), "
+            "10.0, 10, 90.0, (2.0, 2.0))",
+            generated,
+        )
         namespace: dict[str, object] = {}
         exec(generated, namespace)
-        twisted = namespace["_scadtopy_linear_extrude"](
-            namespace["square"](4, center=True), 10, False, 90, 10, 1, 0, 12, 2
-        )
-        self.assertAlmostEqual(twisted.bounding_box()[5], 10)
-        cw = namespace["_scadtopy_linear_extrude"](
-            namespace["rectangle"]([8, 2], center=True), 10, False, 90, 10, 1, 0, 12, 2
-        )
-        ccw = namespace["_scadtopy_linear_extrude"](
-            namespace["rectangle"]([8, 2], center=True), 10, False, -90, 10, 1, 0, 12, 2
-        )
+        cw, ccw = namespace["_parts"][:2]
+        self.assertAlmostEqual(cw.bounding_box()[5], 10)
         # Opposite twist directions are mirror images across the X axis.
         self.assertAlmostEqual(cw.bounding_box()[1], -ccw.bounding_box()[4], places=3)
+        self.assertFalse(cw.is_empty())
+
+    def test_linear_extrude_direct_scale_and_center(self) -> None:
+        generated = self.translate("""
+            linear_extrude(height=10, center=true, scale=[2, 3]) square(2);
+            linear_extrude(height=4, slices=5) square(1);
+            """)
+
+        self.assertNotIn("_scadtopy_linear_extrude", generated)
+        self.assertIn(
+            "extrude_transforming(square(2.0), 10.0, 1, 0, (2.0, 3.0))"
+            ".translate([0, 0, -10.0 / 2])",
+            generated,
+        )
+        self.assertIn("extrude_transforming(square(1.0), 4.0, 5, 0, (1, 1))", generated)
+        namespace: dict[str, object] = {}
+        exec(generated, namespace)
+        self.assertEqual(namespace["_parts"][0].bounding_box(), (0, 0, -5, 4, 6, 5))
+
+    def test_linear_extrude_dynamic_arguments_keep_adapter(self) -> None:
+        generated = self.translate("""
+            module part(angle, count, factor) {
+                linear_extrude(height=10, twist=angle, slices=count, scale=factor)
+                    square([8, 2], center=true);
+            }
+            part(90, 10, 2);
+            part(-90, 10, [2, 3]);
+            """)
+
+        self.assertIn("_scadtopy_linear_extrude(", generated)
+        namespace: dict[str, object] = {}
+        exec(generated, namespace)
+        self.assertEqual(len(namespace["_parts"]), 2)
+        self.assertTrue(all(not part.is_empty() for part in namespace["_parts"]))
+
+    def test_linear_extrude_default_twist_slices_keep_adapter(self) -> None:
+        generated = self.translate(
+            "linear_extrude(height=10, twist=90, slices=0) square(2);"
+        )
+
+        self.assertIn("_scadtopy_linear_extrude(", generated)
+        namespace: dict[str, object] = {}
+        exec(generated, namespace)
         self.assertFalse(namespace["_parts"][0].is_empty())
+
+    def test_linear_extrude_vector_scale_evaluates_elements_once(self) -> None:
+        generated = self.translate("""
+            function factor() = echo("scale") 2;
+            linear_extrude(height=10, scale=[factor(), 3]) square(2);
+            """)
+
+        self.assertNotIn("_scadtopy_linear_extrude", generated)
+        output = io.StringIO()
+        with redirect_stdout(output):
+            exec(generated, {})
+        self.assertEqual(output.getvalue(), "scale\n")
 
     def test_linear_extrude_special_settings_apply_to_slices_and_profile(self) -> None:
         generated = self.translate(
@@ -977,11 +1037,8 @@ class TranslatorTests(unittest.TestCase):
             "_scadtopy_special_fs=1.0)",
             generated,
         )
-        self.assertIn(
-            "_scadtopy_linear_extrude(profile",
-            generated,
-        )
-        self.assertIn("10.0, False, 360.0, None, 1, int(12.0), 6.0, 1.0)", generated)
+        self.assertNotIn("_scadtopy_linear_extrude", generated)
+        self.assertIn(".mirror((True, False)), 10.0, 12, 360.0, (1, 1))", generated)
         namespace: dict[str, object] = {}
         exec(generated, namespace)
         self.assertGreater(namespace["_parts"][0].num_verts(), 0)

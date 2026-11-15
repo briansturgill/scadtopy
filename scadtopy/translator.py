@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import math
 import re
 import warnings
 from contextlib import contextmanager
@@ -1368,6 +1369,11 @@ class _Translator:
                         f".translate([0, 0, (-({height}) / 2 if {center} else 0)])"
                     )
                 return _tidy(extruded)
+            direct = self.direct_linear_extrude(
+                node, self.combine(children), height, center, twist, slices, scale
+            )
+            if direct is not None:
+                return direct
             self.uses_linear_extrude_helper = True
             self.uses_math = True
             fn, fa, fs = self.segment_settings(node.arguments)
@@ -1609,6 +1615,74 @@ class _Translator:
         self.note_fixme(node, f"OpenSCAD module {name!r} has no Piecad mapping")
         return "None"
         raise AssertionError("unreachable")
+
+    def direct_linear_extrude(
+        self,
+        node: ModularCall,
+        profile: str,
+        height: str,
+        center: str | None,
+        twist: str | None,
+        slices: str | None,
+        scale: str | None,
+    ) -> str | None:
+        def number(expression: str) -> int | float | None:
+            try:
+                value = ast.literal_eval(expression)
+            except (ValueError, SyntaxError):
+                return None
+            return value if type(value) in (int, float) else None
+
+        twist_value = number(twist or "0")
+        slices_value = number(slices) if slices is not None else None
+        if twist_value is None or (slices is not None and slices_value is None):
+            return None
+        if not math.isfinite(twist_value) or (
+            slices_value is not None and not math.isfinite(slices_value)
+        ):
+            return None
+        if center not in (None, "False", "True"):
+            return None
+        if center == "True" and number(height) is None:
+            return None
+        for name in ("$fn", "$fa", "$fs"):
+            value = self.argument_value(node.arguments, (name,), -1)
+            if value is not None and number(value) is None:
+                return None
+
+        if slices_value:
+            divisions = int(slices_value)
+        elif not twist_value:
+            divisions = 1
+        else:
+            fn = self.argument_value(node.arguments, ("$fn",), -1)
+            fn_value = number(fn) if fn is not None else None
+            if fn_value is None or not math.isfinite(fn_value) or int(fn_value) <= 0:
+                return None
+            divisions = max(
+                1, math.ceil(abs(twist_value) / 360 * max(int(fn_value), 3))
+            )
+
+        scale = scale or "1"
+        scale_node = ast.parse(scale, mode="eval").body
+        if isinstance(scale_node, ast.List):
+            scale = ast.unparse(ast.Tuple(elts=scale_node.elts, ctx=ast.Load()))
+        elif number(scale) is not None:
+            scale = f"({scale}, {scale})"
+        else:
+            return None
+
+        if twist_value > 0:
+            profile = f"{_receiver(profile)}.mirror((True, False))"
+        result = (
+            f"extrude_transforming({profile}, {height}, {divisions}, "
+            f"{abs(twist_value)!r}, {scale})"
+        )
+        if twist_value > 0:
+            result += ".mirror((True, False, False))"
+        if center == "True":
+            result += f".translate([0, 0, -({height}) / 2])"
+        return result
 
     def transform_call(self, name: str, node: ModularCall, geometry: str) -> str:
         if name == "translate":
