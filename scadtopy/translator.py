@@ -111,7 +111,6 @@ _MATH_FUNCTIONS = {
 }
 
 _BUILTIN_HELPERS = {
-    "sign": ("def _scadtopy_sign(x):\n" "    return (x > 0) - (x < 0)"),
     "round": (
         "def _scadtopy_round(x):\n"
         "    return math.copysign(math.floor(abs(x) + 0.5), x)"
@@ -761,7 +760,7 @@ class _Translator:
             self.helpers.add("concat")
         elif name == "rands" and count in {3, 4}:
             self.helpers.add("rands")
-        elif name in {"sign", "round", "str", "lookup"} and (
+        elif name in {"round", "str", "lookup"} and (
             count == 2 if name == "lookup" else count >= 1
         ):
             self.helpers.add(name)

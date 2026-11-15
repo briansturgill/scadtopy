@@ -1017,6 +1017,23 @@ class TranslatorTests(unittest.TestCase):
         self.assertIn("Vec2.cross([1.0, 0.0], [0.0, 1.0])[2]", generated)
         self.assertIn("e = ceil(1.5)", generated)
 
+    def test_sign_maps_to_piecad(self) -> None:
+        generated = self.translate(
+            "negative = sign(-3); zero = sign(0); positive = sign(3);"
+        )
+
+        self.assertIn("negative = sign(-3.0)", generated)
+        self.assertIn("zero = sign(0.0)", generated)
+        self.assertIn("positive = sign(3.0)", generated)
+        self.assertNotIn("_scadtopy_sign", generated)
+        compile(generated, "<generated-sign>", "exec")
+        namespace: dict[str, object] = {}
+        exec(generated, namespace)
+        self.assertEqual(
+            (namespace["negative"], namespace["zero"], namespace["positive"]),
+            (-1, 0, 1),
+        )
+
     def test_vector_members_map_to_tuple_indexes(self) -> None:
         generated = self.translate(
             "v = [1, 2, 3]; a = v.x; b = v.y; c = v.z; d = [4, 5].y;"
@@ -1067,8 +1084,10 @@ class TranslatorTests(unittest.TestCase):
 
         self.assertIn("a = 1.0 is None", generated)
         self.assertIn("b = [1.0] + [2.0]", generated)
-        for helper in ("round", "sign", "str", "rands", "lookup"):
+        for helper in ("round", "str", "rands", "lookup"):
             self.assertIn(f"def _scadtopy_{helper}(", generated)
+        self.assertIn("d = sign(-1.0)", generated)
+        self.assertNotIn("_scadtopy_sign", generated)
         self.assertIn("import random", generated)
 
     def test_search_builtin_matches_openscad_search_forms(self) -> None:
