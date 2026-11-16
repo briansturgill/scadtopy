@@ -13,7 +13,7 @@ from unittest.mock import patch
 
 from scadtopy import cli as main_module
 from scadtopy import translate_file
-from scadtopy.translator import TranslationError
+from scadtopy.translator import TranslationError, _Translator
 from scadtopy.cli import main
 
 
@@ -709,7 +709,8 @@ class TranslatorTests(unittest.TestCase):
             result = calculate(3);
             """)
         self.assertIn(
-            "def calculate(x):\n    a = x + 1.0\n    b = a * 2.0\n    return a + b",
+            "def calculate(x):\n    a = x + 1.0\n    b = a * 2.0\n"
+            "    return _scadtopy_add(a, b)",
             generated,
         )
         self.assertNotIn("lambda", generated)
@@ -1106,6 +1107,32 @@ class TranslatorTests(unittest.TestCase):
         self.assertEqual([callback() for callback in namespace["callbacks"]], [1, 2])
         self.assertEqual(namespace["x"], 10)
 
+    def test_comprehension_controls_after_comments(self) -> None:
+        generated = self.translate("""
+            conditional = [0, // skipped
+                if(false) 1, // included
+                if(true) 2, 3];
+            bindings = [0, // local binding
+                let(x=[1,2]) each [for(i=x) i*2], 3];
+            nested = [for(i=[1,2]) /* filter */ if(i>1)
+                /* binding */ let(x=i*10) x];
+            branches = [for(i=[0,1]) if(i)
+                /* yes */ each [i,i] else /* no */ each [3]];
+            mixed = [0, // loop
+                for(i=[1,2]) i, // expansion
+                each [3,4], 5];
+            single = [each /* vector */ [6,7]];
+            """)
+        self.assertNotIn("FIXME", generated)
+        namespace: dict[str, object] = {}
+        exec(generated, namespace)
+        self.assertEqual(namespace["conditional"], [0, 2, 3])
+        self.assertEqual(namespace["bindings"], [0, 2, 4, 3])
+        self.assertEqual(namespace["nested"], [20])
+        self.assertEqual(namespace["branches"], [3, 1, 1])
+        self.assertEqual(namespace["mixed"], [0, 1, 2, 3, 4, 5])
+        self.assertEqual(namespace["single"], [6, 7])
+
     def test_marks_unmapped_comprehension_and_translates_each(self) -> None:
         generated = self.translate("""
             original = [1, 2, 3];
@@ -1162,6 +1189,42 @@ class TranslatorTests(unittest.TestCase):
         self.assertEqual(namespace["scalar"], [7])
         self.assertEqual(namespace["undefined"], [])
         self.assertEqual(namespace["characters"], ["a", "b"])
+
+    def test_each_expands_values_within_nested_controls(self) -> None:
+        generated = self.translate("""
+            nested = [each for(i=[1,2]) [i,i+10]];
+            conditional = [each if(true) [1,2] else [3]];
+            bindings = [each let(v=[1,2]) for(i=v) [i,i+10]];
+            doubled = [each each [[1,2],[3,4]]];
+            cfor = [each for(i=0; i<2; i=i+1) [i,i+10]];
+            dynamic = [each for(i=0,j=2; i<2; i=i+1,j=j+1) [i,j]];
+            scoped = [for(i=[1,2]) each for(j=[1:i]) [i,j]];
+            branches = [each for(i=[0,1,2])
+                if(i==0) [1,2] else if(i==1) undef else [3]];
+            """)
+        self.assertNotIn("nested list-comprehension control is approximated", generated)
+        namespace: dict[str, object] = {}
+        exec(generated, namespace)
+        self.assertEqual(namespace["nested"], [1, 11, 2, 12])
+        self.assertEqual(namespace["conditional"], [1, 2])
+        self.assertEqual(namespace["bindings"], [1, 11, 2, 12])
+        self.assertEqual(namespace["doubled"], [1, 2, 3, 4])
+        self.assertEqual(namespace["cfor"], [0, 10, 1, 11])
+        self.assertEqual(namespace["dynamic"], [0, 2, 1, 3])
+        self.assertEqual(namespace["scoped"], [1, 1, 2, 1, 2, 2])
+        self.assertEqual(namespace["branches"], [1, 2, 3])
+
+    def test_nested_each_evaluates_operands_once_in_order(self) -> None:
+        generated = self.translate("""
+            function value(x) = echo(x) [x, x+10];
+            values = [each for(i=[1,2]) value(i)];
+            """)
+        namespace: dict[str, object] = {}
+        output = io.StringIO()
+        with redirect_stdout(output):
+            exec(generated, namespace)
+        self.assertEqual(output.getvalue(), "1.0\n2.0\n")
+        self.assertEqual(namespace["values"], [1, 11, 2, 12])
 
     def test_c_style_comprehensions_support_sequential_updates(self) -> None:
         generated = self.translate("""
@@ -1512,8 +1575,8 @@ class TranslatorTests(unittest.TestCase):
             self.assertAlmostEqual(part.volume(), 1 / 6)
 
     def test_polyhedron_rejects_bad_arguments_and_reports_missing_faces(self) -> None:
-        generated = self.translate("polyhedron(points=[[0,0,0]], convexity=10);")
-        self.assertIn("FIXME: polyhedron() requires points and faces", generated)
+        with self.assertRaisesRegex(TranslationError, "requires points and faces"):
+            self.translate("polyhedron(points=[[0,0,0]], convexity=10);")
         for source in (
             "polyhedron([], [], 1, 2);",
             "polyhedron(points=[], faces=[], unknown=1);",
@@ -2031,6 +2094,64 @@ class TranslatorTests(unittest.TestCase):
         self.assertEqual(flat._color, (0, 255, 0))
         self.assertEqual(repeated.bounding_box(), (0, 0, 0, 5, 2, 2))
 
+    def test_color_handles_runtime_vectors_hex_and_no_color(self) -> None:
+        generated = self.translate("""
+            v = [0.2, 0.4, 0.6, 0.3];
+            color() square(1);
+            color(undef) square(1);
+            color(v) square(1);
+            color([0.5]) square(1);
+            color("#f08a") square(1);
+            color("#11223344") square(1);
+            """)
+        self.assertNotIn("FIXME: color()", generated)
+        namespace: dict[str, object] = {}
+        exec(generated, namespace)
+        parts = namespace["_parts"]
+        self.assertEqual(parts[0]._color, parts[1]._color)
+        self.assertEqual(parts[2]._color, (51, 102, 153))
+        self.assertEqual(parts[3]._color, (128, 255, 255))
+        self.assertEqual(parts[4]._color, (255, 0, 136))
+        self.assertEqual(parts[5]._color, (17, 34, 51))
+
+    def test_color_evaluates_arguments_once_before_child_and_discards_alpha(
+        self,
+    ) -> None:
+        generated = self.translate("""
+            function value(label, result) = echo(label) result;
+            module child_geometry() { echo("child"); square(1); }
+            color(alpha=value("alpha", 0.5), c=value("color", [0.2, 0.4, 0.6]))
+                child_geometry();
+            color([1, 0, 0, value("vector alpha", 0.5)]) child_geometry();
+            """)
+        namespace: dict[str, object] = {}
+        output = io.StringIO()
+        with redirect_stdout(output):
+            exec(generated, namespace)
+        self.assertEqual(
+            output.getvalue(), "alpha\ncolor\nchild\nvector alpha\nchild\n"
+        )
+        self.assertEqual(namespace["_parts"][0]._color, (51, 102, 153))
+        self.assertEqual(namespace["_parts"][1]._color, (255, 0, 0))
+
+    def test_color_names_are_passed_unchanged_to_piecad(self) -> None:
+        from piecad import ValidationError
+
+        generated = self.translate('color("Red") cube(1);')
+        with self.assertRaises(ValidationError):
+            exec(generated, {})
+
+    def test_color_helper_avoids_user_identifiers(self) -> None:
+        generated = self.translate("""
+            _scadtopy_color = 1;
+            round = 2; list = 3; tuple = 4;
+            values = [0.2, 0.4, 0.6];
+            color(values) square(1);
+            """)
+        namespace: dict[str, object] = {}
+        exec(generated, namespace)
+        self.assertEqual(namespace["_parts"][0]._color, (51, 102, 153))
+
     def test_color_multi_child_evaluates_color_once_and_skips_empty_children(
         self,
     ) -> None:
@@ -2323,6 +2444,110 @@ class TranslatorTests(unittest.TestCase):
         self.assertIn("from lib import *", generated)
         self.assertIn("_parts.append(peg())", generated)
 
+    def test_use_reports_missing_source_and_unresolved_modules(self) -> None:
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            generated = self.translate("""
+                use <missing.scad>;
+                unknown();
+                wrapper() cube(1);
+                outer() inner() cube(1);
+                translate([0,0,0]) absent();
+                """)
+
+        messages = [str(warning.message) for warning in caught]
+        self.assertTrue(
+            any(
+                "module not found" in message and "missing.scad" in message
+                for message in messages
+            )
+        )
+        self.assertTrue(
+            any(
+                "module not found" in message and "unknown" in message
+                for message in messages
+            )
+        )
+        self.assertTrue(
+            any(
+                "module not found" in message and "wrapper" in message
+                for message in messages
+            )
+        )
+        self.assertIn("from missing import *", generated)
+        self.assertIn("# module not found: use <missing.scad>", generated)
+        self.assertIn("module not found: OpenSCAD module 'unknown'", generated)
+        self.assertIn("module not found: OpenSCAD module 'wrapper'", generated)
+        self.assertIn("module not found: OpenSCAD module 'outer'", generated)
+        self.assertIn("module not found: OpenSCAD module 'inner'", generated)
+        self.assertIn("module not found: OpenSCAD module 'absent'", generated)
+        self.assertNotIn("module not found: OpenSCAD module 'translate'", generated)
+        self.assertNotIn("FIXME", generated)
+        compile(generated, "<generated-use>", "exec")
+
+    def test_use_reports_unresolved_calls_when_used_source_exists(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "lib.scad").write_text("module peg() cube(1);", encoding="utf-8")
+            source = root / "main.scad"
+            source.write_text("use <lib.scad>; peg(); missing();", encoding="utf-8")
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always")
+                generated = translate_file(source)
+        self.assertIn("_parts.append(peg())", generated)
+        self.assertIn("module not found: OpenSCAD module 'missing'", generated)
+        self.assertFalse(any("use <lib.scad> source" in str(w.message) for w in caught))
+
+    def test_surface_is_unsupported_unless_user_defined(self) -> None:
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            generated = self.translate('surface(file="height.png", center=true);')
+        self.assertIn("# UNSUPPORTED: surface()", generated)
+        self.assertNotIn("FIXME", generated)
+        self.assertTrue(any("UNSUPPORTED: surface()" in str(w.message) for w in caught))
+
+        generated = self.translate("module surface() cube(1); surface();")
+        self.assertNotIn("UNSUPPORTED: surface()", generated)
+        namespace: dict[str, object] = {}
+        exec(generated, namespace)
+        self.assertEqual(len(namespace["_parts"]), 1)
+
+    def test_use_reports_invalid_python_module_names_as_unsupported(self) -> None:
+        for filename, module in (
+            ("my-parts.scad", "my-parts"),
+            ("123.scad", "123"),
+            ("class.scad", "class"),
+            ("nested/None.scad", "None"),
+        ):
+            with self.subTest(filename=filename):
+                with warnings.catch_warnings(record=True) as caught:
+                    warnings.simplefilter("always")
+                    generated = self.translate(f"use <{filename}>;")
+                self.assertEqual(len(caught), 1)
+                self.assertIn("UNSUPPORTED", str(caught[0].message))
+                self.assertIn(
+                    f"{module!r} is not a valid Python module name",
+                    str(caught[0].message),
+                )
+                self.assertIn("# UNSUPPORTED:", generated)
+                self.assertIn(f"{filename!r}", generated)
+                self.assertIn(
+                    f"{module!r} is not a valid Python module name", generated
+                )
+                self.assertNotIn("FIXME", generated)
+                compile(generated, "<generated-use>", "exec")
+
+    def test_use_accepts_valid_python_module_names(self) -> None:
+        for name in ("parts_2", "match"):
+            with self.subTest(name=name):
+                with warnings.catch_warnings(record=True) as caught:
+                    warnings.simplefilter("always")
+                    generated = self.translate(f"use <{name}.scad>;")
+                self.assertEqual(len(caught), 1)
+                self.assertNotIn("UNSUPPORTED", str(caught[0].message))
+                self.assertIn(f"from {name} import *", generated)
+                compile(generated, "<generated-use>", "exec")
+
     def test_used_modules_propagate_only_their_required_segment_settings(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -2483,6 +2708,68 @@ class TranslatorTests(unittest.TestCase):
             (1.0, 2.0, 3.0, 5.0),
         )
 
+    def test_vector_addition_is_componentwise_and_recursive(self) -> None:
+        generated = self.translate("""
+            a = [1, [2, 3], 4];
+            b = [10, [20, 30, 40]];
+            result = a + b;
+            literal = [1, 2] + [3, 4];
+            scalar = 2 + 3;
+            function add(x, y) = x + y;
+            dynamic_scalar = add(4, 5);
+            tuple_vector = version() + [1, 2, 3];
+            """)
+
+        self.assertIn("scalar = 2.0 + 3.0", generated)
+        namespace: dict[str, object] = {}
+        exec(generated, namespace)
+        self.assertEqual(namespace["result"], [11, [22, 33]])
+        self.assertEqual(namespace["literal"], [4, 6])
+        self.assertEqual(namespace["dynamic_scalar"], 9)
+        self.assertEqual(
+            namespace["tuple_vector"],
+            [
+                part + increment
+                for part, increment in zip(
+                    map(int, namespace["version"]().split(".")), (1, 2, 3)
+                )
+            ],
+        )
+
+    def test_vector_addition_evaluates_operands_once_and_avoids_collisions(
+        self,
+    ) -> None:
+        generated = self.translate("""
+            _scadtopy_add = 10;
+            list = 1; tuple = 2; zip = 3;
+            function value(label, result) = echo(label) result;
+            result = value("left", [1, 2]) + value("right", [3, 4]);
+            """)
+
+        self.assertIn("def _scadtopy_add_(", generated)
+        output = io.StringIO()
+        namespace: dict[str, object] = {}
+        with redirect_stdout(output):
+            exec(generated, namespace)
+        self.assertEqual(output.getvalue(), "left\nright\n")
+        self.assertEqual(namespace["result"], [4, 6])
+
+    def test_vector_addition_in_c_style_comprehension(self) -> None:
+        generated = self.translate("""
+            points = [for(i=0, p=[0,0,0]; i<3; i=i+1, p=p+[1,0,0]) p];
+            """)
+
+        namespace: dict[str, object] = {}
+        exec(generated, namespace)
+        self.assertEqual(namespace["points"], [[0, 0, 0], [1, 0, 0], [2, 0, 0]])
+
+    def test_vector_addition_rejects_incompatible_elements(self) -> None:
+        for expression in ("[[1]] + [2]", '["a"] + ["b"]', "[true] + [1]"):
+            with self.subTest(expression=expression):
+                generated = self.translate(f"result = {expression};")
+                with self.assertRaisesRegex(TypeError, "vector addition requires"):
+                    exec(generated, {})
+
     def test_group_and_modifiers(self) -> None:
         generated = self.translate(
             "group() { cube(1); sphere(1); } *cube(5); #cube(2); %sphere(2);"
@@ -2609,7 +2896,7 @@ class TranslatorTests(unittest.TestCase):
         self.assertIn(
             "# UNSUPPORTED: import() parameter(s) positional layer", generated
         )
-        self.assertIn("# UNSUPPORTED: import() parameter(s) center, id", generated)
+        self.assertIn("# UNSUPPORTED: import() parameter(s) id", generated)
         self.assertNotIn("FIXME: import() parameter(s)", generated)
         self.assertEqual(len(caught), 4)
         self.assertTrue(
@@ -2620,9 +2907,238 @@ class TranslatorTests(unittest.TestCase):
             exec(generated, {})
         load.assert_not_called()
 
-    def test_import_reports_missing_filename(self) -> None:
-        generated = self.translate("import();")
-        self.assertIn("FIXME: import() requires a file name", generated)
+    def test_import_rejects_missing_filename(self) -> None:
+        for source in ("import();", "import(file=undef);", 'import("");'):
+            with self.subTest(source=source):
+                with self.assertRaisesRegex(
+                    TranslationError, "import\\(\\) requires a file name"
+                ):
+                    self.translate(source)
+
+    def test_import_rejects_duplicate_file_arguments(self) -> None:
+        for source in (
+            'import("one.stl", file="two.stl");',
+            'import(filename="one.stl", filename="two.stl");',
+            'import("one.stl", undef, 2, convexity=3);',
+        ):
+            with self.subTest(source=source):
+                with self.assertRaisesRegex(TranslationError, "multiple values"):
+                    self.translate(source)
+
+    def test_import_accepts_off_and_preserves_runtime_geometry(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "tetra.OFF"
+            path.write_text(
+                "OFF\n4 4 0\n0 0 0\n1 0 0\n0 1 0\n0 0 1\n"
+                "3 0 2 1\n3 0 1 3\n3 1 2 3\n3 2 0 3\n",
+                encoding="utf-8",
+            )
+            generated = self.translate(f'import("{path}");')
+            self.assertNotIn("FIXME", generated)
+            namespace: dict[str, object] = {}
+            exec(generated, namespace)
+            self.assertAlmostEqual(namespace["_parts"][0].volume(), 1 / 6)
+
+    def test_import_loads_3mf(self) -> None:
+        from piecad import cube, save
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "cube.3mf"
+            save(str(path), cube(1))
+            generated = self.translate(f'import("{path}");')
+            namespace: dict[str, object] = {}
+            exec(generated, namespace)
+            self.assertAlmostEqual(namespace["_parts"][0].volume(), 1)
+
+    def test_legacy_import_stl_loads_stl_regardless_of_filename_extension(self) -> None:
+        from piecad import cube, save
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            stl = root / "cube.stl"
+            renamed = root / "renamed.off"
+            no_extension = root / "mesh"
+            save(str(stl), cube(1))
+            renamed.write_bytes(stl.read_bytes())
+            no_extension.write_bytes(stl.read_bytes())
+            generated = self.translate(f"""
+                filename = "{no_extension}";
+                import_stl("{stl}", convexity=5);
+                import_stl(filename="{renamed}");
+                import_stl(filename);
+                """)
+            self.assertNotIn("FIXME", generated)
+            namespace: dict[str, object] = {}
+            exec(generated, namespace)
+            self.assertEqual(len(namespace["_parts"]), 3)
+            for part in namespace["_parts"]:
+                self.assertAlmostEqual(part.volume(), 1)
+
+    def test_user_defined_import_stl_is_not_treated_as_builtin(self) -> None:
+        generated = self.translate("module import_stl() cube(2); import_stl();")
+        namespace: dict[str, object] = {}
+        exec(generated, namespace)
+        self.assertEqual(namespace["_parts"][0].volume(), 8)
+
+    def test_legacy_import_off_and_dxf_force_their_formats(self) -> None:
+        import ezdxf
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            off = root / "tetra.off"
+            renamed_off = root / "tetra.dxf"
+            dxf = root / "drawing.dxf"
+            renamed_dxf = root / "drawing"
+            off.write_text(
+                "OFF\n4 4 0\n0 0 0\n1 0 0\n0 1 0\n0 0 1\n"
+                "3 0 2 1\n3 0 1 3\n3 1 2 3\n3 2 0 3\n",
+                encoding="utf-8",
+            )
+            renamed_off.write_bytes(off.read_bytes())
+            doc = ezdxf.new()
+            doc.modelspace().add_lwpolyline(
+                [(0, 0), (2, 0), (2, 3), (0, 3)], close=True
+            )
+            doc.saveas(dxf)
+            renamed_dxf.write_bytes(dxf.read_bytes())
+            generated = self.translate(f"""
+                _scadtopy_load_mesh = 1;
+                _scadtopy_load_dxf = 2;
+                mesh = "{renamed_off}";
+                drawing = "{renamed_dxf}";
+                import_off("{off}");
+                import_off(filename="{renamed_off}", center=true);
+                import_off(mesh);
+                import_dxf("{dxf}");
+                translate([1, 2, 9]) import_dxf(drawing, center=true);
+                """)
+            self.assertNotIn("UNSUPPORTED", generated)
+            self.assertIn(f"load('{off}')", generated)
+            self.assertIn(f"load('{dxf}')", generated)
+            namespace: dict[str, object] = {}
+            exec(generated, namespace)
+        parts = namespace["_parts"]
+        self.assertAlmostEqual(parts[0].volume(), 1 / 6)
+        self.assertAlmostEqual(parts[1].volume(), 1 / 6)
+        self.assertAlmostEqual(parts[2].volume(), 1 / 6)
+        self.assertEqual(parts[1].bounding_box(), parts[0].bounding_box())
+        self.assertEqual(parts[3].bounding_box(), (0, 0, 2, 3))
+        self.assertEqual(parts[4].bounding_box(), (1, 2, 3, 5))
+
+    def test_user_defined_legacy_import_modules_are_preserved(self) -> None:
+        generated = self.translate("""
+            module import_off() cube(2);
+            module import_dxf() square(2);
+            import_off(); translate([1, 2, 3]) import_dxf();
+            """)
+        namespace: dict[str, object] = {}
+        exec(generated, namespace)
+        self.assertEqual(namespace["_parts"][0].volume(), 8)
+        self.assertEqual(namespace["_parts"][1].bounding_box(), (1, 2, 3, 4))
+
+    def test_legacy_dxf_reports_unsupported_options(self) -> None:
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            generated = self.translate("""
+                import_dxf("drawing.dxf", layer="outline");
+                import_dxf("drawing.dxf", origin=[1, 2]);
+                import_dxf("drawing.dxf", scale=2);
+                """)
+        self.assertEqual(len(caught), 3)
+        self.assertIn("UNSUPPORTED: import_dxf() parameter(s) layer", generated)
+        self.assertIn("UNSUPPORTED: import_dxf() parameter(s) origin", generated)
+        self.assertIn("UNSUPPORTED: import_dxf() parameter(s) scale", generated)
+
+    def test_legacy_imports_require_filenames(self) -> None:
+        for name in ("import_off", "import_dxf"):
+            with self.subTest(name=name):
+                with self.assertRaisesRegex(TranslationError, "requires a file name"):
+                    self.translate(f"{name}();")
+
+    def test_legacy_import_stl_ignores_non_stl_options_in_order(self) -> None:
+        from piecad import cube, save
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "part.stl"
+            save(str(path), cube(1))
+            generated = self.translate(f"""
+                function value(label, result) = echo(label) result;
+                import_stl(value("file", "{path}"), value("layer", "unused"),
+                           value("convexity", 5), value("origin", [1, 2]),
+                           value("scale", 2), center=value("center", true));
+                """)
+            output = io.StringIO()
+            namespace: dict[str, object] = {}
+            with redirect_stdout(output):
+                exec(generated, namespace)
+        self.assertEqual(
+            output.getvalue(), "file\nlayer\nconvexity\norigin\nscale\ncenter\n"
+        )
+        self.assertEqual(namespace["_parts"][0].bounding_box(), (0, 0, 0, 1, 1, 1))
+
+    def test_import_centers_dynamic_2d_and_3d_geometry(self) -> None:
+        from piecad import cube, square
+
+        generated = self.translate("""
+            function value(label, result) = echo(label) result;
+            import(file=value("file", "drawing.svg"), center=value("center", true));
+            import("part.stl", center=true);
+            import("other.stl", center=false);
+            import(center=value("first", false), file=value("last", "last.stl"));
+            """)
+        output = io.StringIO()
+        namespace: dict[str, object] = {}
+        with (
+            patch(
+                "piecad.load",
+                side_effect=[
+                    square(2).translate([4, 6]),
+                    cube(2).translate([4, 6, 8]),
+                    cube(2).translate([4, 6, 8]),
+                    cube(2).translate([4, 6, 8]),
+                ],
+            ),
+            redirect_stdout(output),
+        ):
+            exec(generated, namespace)
+        self.assertEqual(output.getvalue(), "file\ncenter\nfirst\nlast\n")
+        self.assertEqual(namespace["_parts"][0].bounding_box(), (-1, -1, 1, 1))
+        self.assertEqual(namespace["_parts"][1].bounding_box(), (-1, -1, -1, 1, 1, 1))
+        self.assertEqual(namespace["_parts"][2].bounding_box(), (4, 6, 8, 6, 8, 10))
+        self.assertEqual(namespace["_parts"][3].bounding_box(), (4, 6, 8, 6, 8, 10))
+
+    def test_import_supports_legacy_filename_and_ignores_convexity(self) -> None:
+        from piecad import cube
+
+        generated = self.translate("""
+            function value(label, result) = echo(label) result;
+            import(filename=value("filename", "one.stl"), convexity=value("convexity", 5));
+            import(filename=value("fallback", "two.stl"), file=value("file", undef));
+            import(file=value("preferred", "three.stl"), filename=value("ignored", "four.stl"));
+            import("five.stl", undef, 2);
+            """)
+        output = io.StringIO()
+        with (
+            patch("piecad.load", side_effect=[cube(1) for _ in range(4)]) as load,
+            redirect_stdout(output),
+        ):
+            exec(generated, {})
+        self.assertEqual(
+            output.getvalue(),
+            "filename\nconvexity\nfallback\nfile\npreferred\nignored\n",
+        )
+        self.assertEqual(
+            [call.args[0] for call in load.call_args_list],
+            ["one.stl", "two.stl", "three.stl", "five.stl"],
+        )
+
+    def test_import_unsupported_format_is_reported_as_unsupported(self) -> None:
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            generated = self.translate('import("model.nef3");')
+        self.assertIn("# UNSUPPORTED: import()", generated)
+        self.assertNotIn("FIXME", generated)
+        self.assertTrue(any("UNSUPPORTED" in str(w.message) for w in caught))
 
     def test_import_loads_runtime_svg_and_propagates_missing_file(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -2981,19 +3497,40 @@ class TranslatorTests(unittest.TestCase):
         )
         compile(generated, "<generated>", "exec")
 
-    def test_marks_unmapped_parser_nodes_for_follow_up(self) -> None:
+    def test_reports_unresolved_modules_with_use(self) -> None:
         generated = self.translate(
             "for (i = [0:2]) cube(1); bevel(2); use <library.scad>;"
         )
 
-        self.assertIn("pass  # FIXME", generated)
-        compile(generated, "<generated-fixmes>", "exec")
+        self.assertIn("module not found: OpenSCAD module 'bevel'", generated)
+        compile(generated, "<generated-missing-module>", "exec")
 
-    def test_marks_unknown_modules_for_follow_up(self) -> None:
-        generated = self.translate("bevel(2);")
-
-        self.assertIn("OpenSCAD module 'bevel' has no Piecad mapping", generated)
+    def test_reports_unknown_modules_without_use(self) -> None:
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            generated = self.translate(
+                "bevel(2); wrapper() cube(1); outer() inner() cube(1);"
+            )
+        for name in ("bevel", "wrapper", "outer", "inner"):
+            self.assertIn(f"module not found: OpenSCAD module '{name}'", generated)
+            self.assertTrue(any(f"'{name}'" in str(item.message) for item in caught))
+        self.assertIn("child geometry is omitted", generated)
+        self.assertNotIn("FIXME", generated)
         self.assertIn("_parts = []", generated)
+
+    def test_unknown_ast_nodes_are_reported_unsupported(self) -> None:
+        translator = _Translator()
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            generated = translator.translate([object()])
+            self.assertEqual(translator.expression(object()), "None")
+            self.assertEqual(translator.module_call(object()), "None")
+            translator.echo_statement([object()])
+        self.assertIn("UNSUPPORTED: object is not translated", generated)
+        self.assertTrue(any("expression" in str(item.message) for item in caught))
+        self.assertTrue(any("echo argument" in str(item.message) for item in caught))
+        self.assertTrue(all("UNSUPPORTED" in str(item.message) for item in caught))
+        self.assertNotIn("FIXME", generated)
 
     def test_marks_unmapped_transform_parameters(self) -> None:
         with self.assertRaisesRegex(TranslationError, "Unsupported linear_extrude"):

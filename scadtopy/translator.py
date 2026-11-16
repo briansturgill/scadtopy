@@ -28,7 +28,6 @@ from openscad_parser.ast.nodes import (
     GreaterThanOp,
     GreaterThanOrEqualOp,
     Identifier,
-    IncludeStatement,
     ListComprehension,
     ListCompCFor,
     ListCompEach,
@@ -298,6 +297,12 @@ def _contains_function_literal(node: object) -> bool:
     return False
 
 
+def _uncommented_expression(node: object) -> object:
+    while isinstance(node, CommentedExpr):
+        node = node.expr
+    return node
+
+
 def _unwrap_commented_names(node: object) -> None:
     """Replace comment-wrapped identifiers in `name` slots with the identifier."""
     if isinstance(node, (list, tuple)):
@@ -308,9 +313,7 @@ def _unwrap_commented_names(node: object) -> None:
             if key == "position":
                 continue
             if key == "name" and isinstance(value, CommentedExpr):
-                while isinstance(value, CommentedExpr):
-                    value = value.expr
-                setattr(node, key, value)
+                setattr(node, key, _uncommented_expression(value))
             else:
                 _unwrap_commented_names(value)
 
@@ -537,7 +540,18 @@ _CENTER_MODULES = frozenset({"cube", "square", "cylinder", "linear_extrude"})
 
 _EXPORT_COMMENT = re.compile(r"\s*export\s+(\S+\.\w+)\s*$", re.I)
 
-_PIECAD_LOAD_EXTENSIONS = {"3mf", "dxf", "glb", "gltf", "obj", "ply", "stl", "svg"}
+_PIECAD_LOAD_EXTENSIONS = {
+    "3mf",
+    "dxf",
+    "glb",
+    "gltf",
+    "obj",
+    "off",
+    "ply",
+    "stl",
+    "stl_ascii",
+    "svg",
+}
 _UNSUPPORTED_SPECIAL_VARIABLES = {"$t", "$preview", "$vpr", "$vpt", "$vpd"}
 
 
@@ -600,6 +614,7 @@ class _Translator:
         self.modules_with_nested_defaults: set[str] = set()
         self.imported_identifiers: set[str] = set()
         self.unknown_imports = False
+        self.has_use = False
         self.user_identifiers: set[str] = set()
         self.segment_modules: dict[str, set[str]] = {}
         self.geometry_modules: dict[str, ModuleDeclaration] = {}
@@ -610,11 +625,19 @@ class _Translator:
         self.uses_text_helper = False
         self.uses_color_group_helper = False
         self.color_group_helper = "_scadtopy_color_group"
+        self.uses_color_helper = False
+        self.color_helper = "_scadtopy_color"
+        self.uses_mesh_import_helper = False
+        self.mesh_import_helper = "_scadtopy_load_mesh"
+        self.uses_dxf_import_helper = False
+        self.dxf_import_helper = "_scadtopy_load_dxf"
         self.uses_translate_helper = False
         self.uses_rotate_helper = False
         self.rotate_helper = "_scadtopy_rotate"
         self.uses_mirror_helper = False
         self.mirror_helper = "_scadtopy_mirror"
+        self.uses_add_helper = False
+        self.add_helper = "_scadtopy_add"
         self.projected_transform_helper = "_scadtopy_projected_transform"
         self.uses_resize_helper = False
         self.uses_segments_helper = False
@@ -657,6 +680,7 @@ class _Translator:
         self.user_identifiers = identifiers
         self.imported_identifiers = set()
         self.unknown_imports = False
+        self.has_use = any(isinstance(node, UseStatement) for node in nodes)
         self.segment_unset = "_scadtopy_unset"
         while self.segment_unset in identifiers:
             self.segment_unset += "_"
@@ -671,9 +695,13 @@ class _Translator:
         self.uses_linear_extrude_helper = False
         self.uses_text_helper = False
         self.uses_color_group_helper = False
+        self.uses_color_helper = False
+        self.uses_mesh_import_helper = False
+        self.uses_dxf_import_helper = False
         self.uses_translate_helper = False
         self.uses_rotate_helper = False
         self.uses_mirror_helper = False
+        self.uses_add_helper = False
         self.uses_resize_helper = False
         self.uses_segments_helper = False
         self.uses_vec2 = False
@@ -695,7 +723,7 @@ class _Translator:
             if node.name.name not in nested_names
             and sum(other.name.name == node.name.name for other in declarations) == 1
         }
-        if any(isinstance(node, UseStatement) for node in nodes):
+        if self.has_use:
             self.geometry_modules.clear()
         for node in nodes:
             if isinstance(node, UseStatement):
@@ -705,12 +733,28 @@ class _Translator:
             self.user_identifiers | self.imported_identifiers
         ):
             self.color_group_helper += "_"
+        self.color_helper = "_scadtopy_color"
+        while self.color_helper in self.user_identifiers | self.imported_identifiers:
+            self.color_helper += "_"
+        self.mesh_import_helper = "_scadtopy_load_mesh"
+        while (
+            self.mesh_import_helper in self.user_identifiers | self.imported_identifiers
+        ):
+            self.mesh_import_helper += "_"
+        self.dxf_import_helper = "_scadtopy_load_dxf"
+        while (
+            self.dxf_import_helper in self.user_identifiers | self.imported_identifiers
+        ):
+            self.dxf_import_helper += "_"
         self.rotate_helper = "_scadtopy_rotate"
         while self.rotate_helper in self.user_identifiers | self.imported_identifiers:
             self.rotate_helper += "_"
         self.mirror_helper = "_scadtopy_mirror"
         while self.mirror_helper in self.user_identifiers | self.imported_identifiers:
             self.mirror_helper += "_"
+        self.add_helper = "_scadtopy_add"
+        while self.add_helper in self.user_identifiers | self.imported_identifiers:
+            self.add_helper += "_"
         self.projected_transform_helper = "_scadtopy_projected_transform"
         while self.projected_transform_helper in (
             self.user_identifiers | self.imported_identifiers
@@ -843,15 +887,8 @@ class _Translator:
             elif isinstance(node, UseStatement):
                 statements.append(self.use_statement(node))
                 last_statement_is_model = False
-            elif isinstance(node, IncludeStatement):
-                statements.append(
-                    f"pass  # FIXME: include {node.filepath.val!r} was not expanded"
-                )
-                last_statement_is_model = False
             else:
-                statements.append(
-                    f"pass  # FIXME: {_node_name(node)} is not translated"
-                )
+                self.note_unsupported(node, f"{_node_name(node)} is not translated")
                 last_statement_is_model = False
 
         if saw_model:
@@ -885,6 +922,39 @@ class _Translator:
         if self.uses_vec2:
             prefix += "from piecad.lin_math import Vec2\n"
         prefix += "\n"
+        if self.uses_add_helper:
+            prefix += (
+                f"def {self.add_helper}(left, right, _component=False):\n"
+                "    import builtins\n"
+                "    import numbers\n"
+                "    if builtins.isinstance(left, (builtins.list, builtins.tuple)) and "
+                "builtins.isinstance(right, (builtins.list, builtins.tuple)):\n"
+                f"        return [{self.add_helper}(a, b, True) for a, b in builtins.zip(left, right)]\n"
+                "    if _component and not (builtins.isinstance(left, numbers.Real) and "
+                "not builtins.isinstance(left, builtins.bool) and "
+                "builtins.isinstance(right, numbers.Real) and "
+                "not builtins.isinstance(right, builtins.bool)):\n"
+                "        raise builtins.TypeError('vector addition requires numeric or vector components')\n"
+                "    return left + right\n\n"
+            )
+        if self.uses_mesh_import_helper:
+            prefix += (
+                f"def {self.mesh_import_helper}(filename, file_type):\n"
+                "    import builtins\n"
+                "    import trimesh\n"
+                "    from piecad import obj3d_from_vertices_and_faces\n"
+                "    with builtins.open(filename, 'rb') as stream:\n"
+                "        mesh = trimesh.exchange.load.load(stream, file_type=file_type, "
+                "force='mesh', process=True, validate=False)\n"
+                "    return obj3d_from_vertices_and_faces(mesh.vertices, mesh.faces)\n\n"
+            )
+        if self.uses_dxf_import_helper:
+            prefix += (
+                f"def {self.dxf_import_helper}(filename):\n"
+                "    import builtins\n"
+                "    from piecad import path\n"
+                "    return builtins.type(path()).from_dxf(filename).to_obj2d()\n\n"
+            )
         if self.expression_definitions:
             prefix += "\n\n".join(self.expression_definitions) + "\n\n"
         segment_defaults = "".join(
@@ -1057,6 +1127,23 @@ class _Translator:
                 "    return union(*picked) if len(picked) > 1 "
                 "else (picked[0] if picked else None)\n\n"
             )
+        if self.uses_color_helper:
+            prefix += (
+                f"def {self.color_helper}(color, obj):\n"
+                "    import builtins\n"
+                "    if color is None:\n"
+                "        return obj\n"
+                "    if builtins.isinstance(color, (builtins.list, builtins.tuple)):\n"
+                "        rgb = builtins.list(color[:3])\n"
+                "        rgb.extend([1] * (3 - builtins.len(rgb)))\n"
+                "        color = builtins.tuple(builtins.round(value * 255) for value in rgb)\n"
+                "    elif builtins.isinstance(color, builtins.str) and color.startswith('#'):\n"
+                "        if builtins.len(color) in (4, 5, 9) and "
+                "builtins.all(value in '0123456789abcdefABCDEF' for value in color[1:]):\n"
+                "            color = ('#' + ''.join(value * 2 for value in color[1:4]) "
+                "if builtins.len(color) in (4, 5) else color[:7])\n"
+                "    return obj.color(color)\n\n"
+            )
         if self.uses_color_group_helper:
             prefix += (
                 f"def {self.color_group_helper}(color, *children):\n"
@@ -1068,7 +1155,7 @@ class _Translator:
                 "for child in children):\n"
                 "        raise builtins.ValueError('UNSUPPORTED: color() cannot combine 2D and 3D children')\n"
                 "    geometry = union(*children) if builtins.len(children) > 1 else children[0]\n"
-                "    return geometry.color(color)\n\n"
+                f"    return {self.color_helper}(color, geometry)\n\n"
             )
         if self.uses_text_helper:
             prefix += (
@@ -1244,17 +1331,35 @@ class _Translator:
         }
 
     def use_statement(self, node: UseStatement) -> str:
+        module = Path(node.filepath.val).stem
+        missing = (
+            self.base_dir is None or not (self.base_dir / node.filepath.val).is_file()
+        )
+        missing_message = (
+            f"module not found: use <{node.filepath.val}> source was not found "
+            "relative to the source directory"
+            if missing
+            else ""
+        )
+        missing_comment = f"# {missing_message}{_position(node)}\n" if missing else ""
+        if not module.isidentifier() or keyword.iskeyword(module):
+            message = f"use {node.filepath.val!r}: {module!r} is not a valid Python module name"
+            self.warn(
+                node,
+                (
+                    f"{missing_message}; UNSUPPORTED: {message}"
+                    if missing
+                    else f"UNSUPPORTED: {message}"
+                ),
+            )
+            return f"{missing_comment}# UNSUPPORTED: {message}{_position(node)}"
         self.warn(
             node,
-            f"use <{node.filepath.val}> emits a Python import only; "
+            (f"{missing_message}; " if missing else "")
+            + f"use <{node.filepath.val}> emits a Python import only; "
             "translate the used .scad file separately to a matching .py file",
         )
-        module = Path(node.filepath.val).stem
-        if not module.isidentifier():
-            return (
-                f"pass  # FIXME: cannot import {node.filepath.val!r} as a Python module"
-            )
-        return f"from {module} import *"
+        return f"{missing_comment}from {module} import *"
 
     def save_lines(self) -> list[str]:
         if not self.output_stem:
@@ -1365,9 +1470,7 @@ class _Translator:
             elif isinstance(child, BlankLine):
                 assignments.append("")
             else:
-                assignments.append(
-                    f"    pass  # FIXME: {_node_name(child)} is not translated"
-                )
+                self.note_unsupported(child, f"{_node_name(child)} is not translated")
 
         self.in_module = previous_in_module
         lines[1:1] = [
@@ -1547,7 +1650,9 @@ class _Translator:
                     (repr(f"{argument.name.name} ="), self.expression(argument.expr))
                 )
             else:
-                self.note_fixme(argument, "unknown echo argument is not translated")
+                self.note_unsupported(
+                    argument, "unknown echo argument is not translated"
+                )
         return f"{self.echo_print}({', '.join(values)})"
 
     def echo_expression(self, arguments: list[object], result: str) -> str:
@@ -1906,14 +2011,27 @@ class _Translator:
         if isinstance(node, ModularModifierDisable):
             return "None"
         if not isinstance(node, ModularCall):
-            self.note_fixme(node, f"{_node_name(node)} is not translated")
+            self.note_unsupported(node, f"{_node_name(node)} is not translated")
             return "None"
 
         name = node.name.name
+        legacy_format = (
+            name.removeprefix("import_")
+            if name in {"import_stl", "import_off", "import_dxf"}
+            and name not in self.module_names
+            else None
+        )
+        legacy_mesh = legacy_format in {"stl", "off"}
+        if name == "surface" and name not in self.module_names:
+            self.note_unsupported(
+                node, "surface() is not translated; geometry is omitted"
+            )
+            return "None"
         if (
             name not in self.module_names
             and name not in _CENTER_MODULES
             and name != "import"
+            and not legacy_format
         ):
             # OpenSCAD silently ignores arguments a built-in doesn't have.
             node.arguments = [
@@ -1924,7 +2042,11 @@ class _Translator:
                     and argument.name.name == "center"
                 )
             ]
-        arguments = self.call_arguments(node.arguments) if name != "import" else []
+        arguments = (
+            self.call_arguments(node.arguments)
+            if name not in {"import", "color"} and not legacy_format
+            else []
+        )
         previous_segment_overrides = self.segment_overrides
         if name in {"linear_extrude", "offset", "rotate_extrude"}:
             self.segment_overrides = self.segment_settings(node.arguments)
@@ -1942,6 +2064,39 @@ class _Translator:
         finally:
             self.segment_overrides = previous_segment_overrides
         if source_children and all(child == "None" for child in children):
+            if (
+                name not in self.module_names
+                and name not in _TRANSFORMS
+                and name not in _PIECAD_NAMES
+                and name
+                not in {
+                    "resize",
+                    "multmatrix",
+                    "linear_extrude",
+                    "rotate_extrude",
+                    "minkowski",
+                    "offset",
+                    "projection",
+                    "render",
+                    "group",
+                    "color",
+                    "text",
+                    "import",
+                    "import_stl",
+                    "import_off",
+                    "import_dxf",
+                    "polyhedron",
+                    "cube",
+                    "sphere",
+                    "cylinder",
+                    "square",
+                    "circle",
+                    "polygon",
+                    "child",
+                    "children",
+                }
+            ):
+                self.note_missing_module(node, name, True)
             return "None"
         children = [child for child in children if child != "None"]
 
@@ -2143,6 +2298,19 @@ class _Translator:
             self.reject_unexpected_named_arguments(node, {"c", "alpha"})
             if not children:
                 return "None"
+            color = self.argument_expression(node.arguments, ("c",), 0)
+            alpha = self.argument_expression(node.arguments, ("alpha",), 1)
+            color_node = _uncommented_expression(color)
+            alpha_node = _uncommented_expression(alpha)
+            evaluate_alpha = alpha is not None and not (
+                _literal_number(alpha_node) is not None
+                or isinstance(
+                    alpha_node, (BooleanLiteral, StringLiteral, UndefinedLiteral)
+                )
+            )
+            no_color = color is None or isinstance(color_node, UndefinedLiteral)
+            if no_color and not evaluate_alpha:
+                return self.combine(children)
             dimensions = {
                 2 if child.name.name in {"square", "circle", "polygon"} else 3
                 for child in source_children
@@ -2156,23 +2324,62 @@ class _Translator:
                     node, "color() cannot combine 2D and 3D child geometry"
                 )
                 return "None"
-            color = self.argument_expression(node.arguments, ("c",), 0)
-            if color is None:
-                self.note_fixme(node, "color() without a color argument")
-                return self.combine(children)
-            if isinstance(color, ListComprehension):
-                values = [self.expression(value) for value in color.elements]
-                if len(values) not in {3, 4}:
-                    self.note_fixme(node, "only RGB/RGBA color vectors are supported")
-                    return self.combine(children)
-                rgb = ", ".join(f"round(({value}) * 255)" for value in values[:3])
-                color_value = f"({rgb})"
+            parameters = []
+            values = []
+            color_parameter = "_scadtopy_color_arg"
+            alpha_parameter = "_scadtopy_alpha_arg"
+            reserved = self.user_identifiers | self.imported_identifiers
+            while color_parameter in reserved:
+                color_parameter += "_"
+            while alpha_parameter in reserved:
+                alpha_parameter += "_"
+            if evaluate_alpha:
+                for argument in node.arguments:
+                    if not isinstance(argument, (NamedArgument, PositionalArgument)):
+                        self.unsupported(argument)
+                    if argument.expr is color:
+                        parameters.append(color_parameter)
+                    elif argument.expr is alpha:
+                        parameters.append(alpha_parameter)
+                    else:
+                        continue
+                    values.append(self.expression(argument.expr))
+            if no_color:
+                result = self.combine(children)
             else:
-                color_value = self.expression(color)
-            if len(children) == 1:
-                return f"{_receiver(children[0])}.color({color_value})"
-            self.uses_color_group_helper = True
-            return f"{self.color_group_helper}({color_value}, {', '.join(children)})"
+                vector = _literal_numeric_vector(color_node, (3, 4))
+                if evaluate_alpha:
+                    color_value = color_parameter
+                elif vector is not None and len(children) == 1:
+                    color_value = repr(
+                        tuple(round(value * 255) for value in vector[:3])
+                    )
+                else:
+                    color_value = self.expression(color)
+                direct = not evaluate_alpha and (
+                    vector is not None
+                    or (
+                        isinstance(color_node, StringLiteral)
+                        and (
+                            not color_node.val.startswith("#")
+                            or len(color_node.val) == 7
+                        )
+                    )
+                )
+                if len(children) == 1 and direct:
+                    result = f"{_receiver(children[0])}.color({color_value})"
+                elif len(children) == 1:
+                    self.uses_color_helper = True
+                    result = f"{self.color_helper}({color_value}, {children[0]})"
+                else:
+                    self.uses_color_helper = True
+                    self.uses_color_group_helper = True
+                    result = f"{self.color_group_helper}({color_value}, {', '.join(children)})"
+            if evaluate_alpha:
+                return (
+                    f"(lambda {', '.join(parameters)}: {result})({', '.join(values)})"
+                )
+            return result
         if name == "text":
             self.reject_children(node, children)
             text = self.argument_value(node.arguments, ("text",), 0)
@@ -2207,52 +2414,215 @@ class _Translator:
                 f"_scadtopy_text({text}, {size}, "
                 f"{halign or repr('left')}, {valign or repr('baseline')})"
             )
-        if name == "import":
+        if name == "import" or legacy_format:
             self.reject_children(node, children)
             file_node = self.argument_expression(node.arguments, ("file",), 0)
-            if file_node is None:
-                self.note_fixme(node, "import() requires a file name")
-                return "None"
+            legacy_file = self.argument_expression(node.arguments, ("filename",), -1)
+            if (
+                file_node is None
+                or isinstance(_uncommented_expression(file_node), UndefinedLiteral)
+            ) and (
+                legacy_file is None
+                or isinstance(_uncommented_expression(legacy_file), UndefinedLiteral)
+            ):
+                raise TranslationError(
+                    f"{name}() requires a file name{_position(node)}"
+                )
+            positional_parameters = ("file", "layer", "convexity")
+            if legacy_mesh:
+                positional_parameters += ("origin", "scale")
+            for position, parameter in enumerate(positional_parameters):
+                named = sum(
+                    isinstance(argument, NamedArgument)
+                    and argument.name.name == parameter
+                    for argument in node.arguments
+                )
+                positional_count = sum(
+                    isinstance(argument, PositionalArgument)
+                    for argument in node.arguments
+                )
+                if named > 1 or (named and positional_count > position):
+                    raise TranslationError(
+                        f"{name}() got multiple values for {parameter!r}{_position(node)}"
+                    )
+            for parameter in ("filename", "center"):
+                if (
+                    sum(
+                        isinstance(argument, NamedArgument)
+                        and argument.name.name == parameter
+                        for argument in node.arguments
+                    )
+                    > 1
+                ):
+                    raise TranslationError(
+                        f"{name}() got multiple values for {parameter!r}{_position(node)}"
+                    )
             unsupported_arguments = {
                 argument.name.name
                 for argument in node.arguments
                 if isinstance(argument, NamedArgument)
-            } - {"file", "convexity"}
+                and argument.name.name
+                not in (
+                    {
+                        "file",
+                        "filename",
+                        "convexity",
+                        "center",
+                        "layer",
+                        "layername",
+                        "origin",
+                        "scale",
+                    }
+                    if legacy_mesh
+                    else {"file", "filename", "convexity", "center"}
+                )
+                and not (
+                    argument.name.name in {"layer", "layername"}
+                    and isinstance(
+                        _uncommented_expression(argument.expr), UndefinedLiteral
+                    )
+                )
+            }
             positional = [
                 argument
                 for argument in node.arguments
                 if isinstance(argument, PositionalArgument)
             ]
-            if len(positional) > 1:
+            if (
+                not legacy_mesh
+                and len(positional) > 1
+                and not isinstance(
+                    _uncommented_expression(positional[1].expr), UndefinedLiteral
+                )
+            ):
                 unsupported_arguments.add("positional layer")
+            if len(positional) > len(positional_parameters):
+                unsupported_arguments.add("positional arguments after convexity")
             if unsupported_arguments:
                 self.note_unsupported(
                     node,
-                    f"import() parameter(s) {', '.join(sorted(unsupported_arguments))} "
+                    f"{name}() parameter(s) {', '.join(sorted(unsupported_arguments))} "
                     "are not supported by Piecad load()",
                 )
                 return "None"
-            if isinstance(file_node, StringLiteral):
-                extension = file_node.val.rpartition(".")[2].lower()
-                if extension not in _PIECAD_LOAD_EXTENSIONS:
-                    self.note_fixme(
+            selected_literal = (
+                legacy_file
+                if file_node is None
+                or isinstance(_uncommented_expression(file_node), UndefinedLiteral)
+                else file_node
+            )
+            selected_literal = _uncommented_expression(selected_literal)
+            if isinstance(selected_literal, StringLiteral):
+                if not selected_literal.val:
+                    raise TranslationError(
+                        f"{name}() requires a file name{_position(node)}"
+                    )
+                extension = selected_literal.val.rpartition(".")[2].lower()
+                if not legacy_format and extension not in _PIECAD_LOAD_EXTENSIONS:
+                    self.note_unsupported(
                         node,
-                        f"import() of .{extension} files is not supported by Piecad load()",
+                        f"import() of .{extension} files is not supported by this translator",
                     )
                     return "None"
-            filename = self.expression(file_node)
-            warning_argument = (
-                f'"{file_node.val}"'
-                if isinstance(file_node, StringLiteral)
-                else filename
+            convexity_node = self.argument_expression(node.arguments, ("convexity",), 2)
+            evaluate_convexity = convexity_node is not None and not (
+                _literal_number(_uncommented_expression(convexity_node)) is not None
+                or isinstance(
+                    _uncommented_expression(convexity_node),
+                    (BooleanLiteral, StringLiteral, UndefinedLiteral),
+                )
             )
+            center_node = self.argument_expression(node.arguments, ("center",), -1)
+            center_literal = _uncommented_expression(center_node)
+            dynamic_center = center_node is not None and not (
+                _literal_number(center_literal) is not None
+                or isinstance(
+                    center_literal, (BooleanLiteral, StringLiteral, UndefinedLiteral)
+                )
+            )
+            values = []
+            parameters = []
+            for argument in node.arguments:
+                if not isinstance(argument, (NamedArgument, PositionalArgument)):
+                    self.unsupported(argument)
+                if argument.expr is file_node:
+                    parameters.append("_scadtopy_file")
+                elif argument.expr is legacy_file:
+                    parameters.append("_scadtopy_filename")
+                elif evaluate_convexity and argument.expr is convexity_node:
+                    parameters.append("_scadtopy_convexity")
+                elif dynamic_center and argument.expr is center_node:
+                    parameters.append("_scadtopy_center")
+                elif legacy_mesh and not isinstance(
+                    _uncommented_expression(argument.expr),
+                    (BooleanLiteral, StringLiteral, NumberLiteral, UndefinedLiteral),
+                ):
+                    parameter = f"_scadtopy_ignored_{len(parameters)}"
+                    while (
+                        parameter in self.user_identifiers | self.imported_identifiers
+                    ):
+                        parameter += "_"
+                    parameters.append(parameter)
+                else:
+                    continue
+                values.append(self.expression(argument.expr))
+            if file_node is not None and legacy_file is not None:
+                selected = (
+                    "_scadtopy_file if _scadtopy_file is not None "
+                    "else _scadtopy_filename"
+                )
+            elif file_node is not None:
+                selected = "_scadtopy_file"
+            else:
+                selected = "_scadtopy_filename"
+            simple = len(parameters) == 1
+            filename = values[0] if simple else selected
+            if legacy_format and not (
+                isinstance(selected_literal, StringLiteral)
+                and selected_literal.val.lower().endswith(f".{legacy_format}")
+            ):
+                if legacy_format == "dxf":
+                    self.uses_dxf_import_helper = True
+                    load_call = f"{self.dxf_import_helper}({filename})"
+                else:
+                    self.uses_mesh_import_helper = True
+                    load_call = (
+                        f"{self.mesh_import_helper}({filename}, {legacy_format!r})"
+                    )
+            else:
+                load_call = f"load({filename})"
+            if (
+                not legacy_format
+                and isinstance(center_literal, BooleanLiteral)
+                and center_literal.val
+            ):
+                load_call += ".center()"
+            elif not legacy_format and dynamic_center:
+                load_call = f"({load_call}.center() if _scadtopy_center is True else {load_call})"
+            if not simple:
+                load_call = (
+                    f"(lambda {', '.join(parameters)}: {load_call})"
+                    f"({', '.join(values)})"
+                )
+            rendered_arguments = dict(zip(parameters, values))
+            if isinstance(selected_literal, StringLiteral):
+                warning_argument = f'"{selected_literal.val}"'
+            elif file_node is not None and legacy_file is not None:
+                warning_argument = (
+                    f"{rendered_arguments['_scadtopy_file']} "
+                    f"(or {rendered_arguments['_scadtopy_filename']} if undefined)"
+                )
+            elif file_node is not None:
+                warning_argument = rendered_arguments["_scadtopy_file"]
+            else:
+                warning_argument = rendered_arguments["_scadtopy_filename"]
             self.warn(
                 node,
-                f"import({warning_argument}) is passed to Piecad unchanged and "
+                f"{name}({warning_argument}) is passed to Piecad unchanged and "
                 "resolves relative to the Python process working directory, "
                 "not the .scad file directory",
             )
-            return f"load({filename})"
+            return load_call
         if name == "polyhedron":
             self.reject_children(node, children)
             self.reject_unexpected_named_arguments(
@@ -2323,8 +2693,9 @@ class _Translator:
                     f"for face in {faces} for i in range(1, len(face) - 1)]"
                 )
                 return f"polyhedron({points}, {triangles}, check='repair')"
-            self.note_fixme(node, "polyhedron() requires points and faces")
-            return "None"
+            raise TranslationError(
+                f"polyhedron() requires points and faces{_position(node)}"
+            )
 
         if name == "cube":
             self.reject_children(node, children)
@@ -2392,14 +2763,8 @@ class _Translator:
             if passes_children:
                 arguments.append(f"_children=[{', '.join(children)}]")
             return f"{self.py_name(name)}({', '.join(arguments)})"
-        if children:
-            self.note_fixme(
-                node, f"child geometry for module {name!r} is not translated"
-            )
-            return "None"
-        self.note_fixme(node, f"OpenSCAD module {name!r} has no Piecad mapping")
+        self.note_missing_module(node, name, bool(source_children))
         return "None"
-        raise AssertionError("unreachable")
 
     def direct_linear_extrude(
         self,
@@ -2980,12 +3345,21 @@ class _Translator:
         name = nodes.name.name
         if name == "children" or (name == "child" and name not in self.module_names):
             return children_dimension
+        if name in {"import_stl", "import_off"} and name not in self.module_names:
+            return 3
+        if name == "import_dxf" and name not in self.module_names:
+            return 2
         if name == "assign" and name not in self.module_names:
             return self.geometry_dimension(
                 nodes.children, active_modules, children_dimension
             )
         if name == "import":
             file_node = self.argument_expression(nodes.arguments, ("file",), 0)
+            if file_node is None or isinstance(
+                _uncommented_expression(file_node), UndefinedLiteral
+            ):
+                file_node = self.argument_expression(nodes.arguments, ("filename",), -1)
+            file_node = _uncommented_expression(file_node)
             if isinstance(file_node, StringLiteral):
                 extension = file_node.val.rpartition(".")[2].lower()
                 if extension in _PIECAD_LOAD_EXTENSIONS:
@@ -3031,18 +3405,20 @@ class _Translator:
             )
         return None
 
-    def note_fixme(self, node: object, message: str) -> None:
-        line = _position(node).removeprefix(" at line ")
-        location = f" at line {line}" if line else ""
-        fixme = f"pass  # FIXME: {message}{location}"
-        if fixme not in self.diagnostics:
-            self.diagnostics.append(fixme)
-
     def note_unsupported(self, node: object, message: str) -> None:
         diagnostic = f"# UNSUPPORTED: {message}{_position(node)}"
         if diagnostic not in self.diagnostics:
             self.diagnostics.append(diagnostic)
             self.warn(node, f"UNSUPPORTED: {message}")
+
+    def note_missing_module(self, node: object, name: str, children: bool) -> None:
+        message = f"module not found: OpenSCAD module {name!r} could not be resolved"
+        if children:
+            message += "; child geometry is omitted"
+        diagnostic = f"# {message}{_position(node)}"
+        if diagnostic not in self.diagnostics:
+            self.diagnostics.append(diagnostic)
+            self.warn(node, message)
 
     def let_expression(self, assignments: list[Assignment], body: str) -> str:
         for index in reversed(range(len(assignments))):
@@ -3054,7 +3430,7 @@ class _Translator:
 
     def list_comprehension(self, node: ListComprehension) -> str:
         elements = [
-            element
+            _uncommented_expression(element)
             for element in node.elements
             if not isinstance(element, (CommentLine, CommentSpan, BlankLine))
         ]
@@ -3063,20 +3439,23 @@ class _Translator:
         controls = (ListCompCFor, ListCompFor, ListCompIf, ListCompIfElse)
         if len(elements) == 1 and isinstance(elements[0], ListCompEach):
             element = elements[0]
-            if isinstance(element.body, (ListComprehension, RangeLiteral)):
-                return self.expression(element.body)
-            if isinstance(element.body, UndefinedLiteral):
+            body = _uncommented_expression(element.body)
+            if isinstance(body, (ListComprehension, RangeLiteral)):
+                return self.expression(body)
+            if isinstance(body, UndefinedLiteral):
                 return "[]"
-            if isinstance(element.body, (NumberLiteral, BooleanLiteral)):
-                return f"[{self.expression(element.body)}]"
-            if isinstance(element.body, StringLiteral):
-                return f"[*{self.expression(element.body)}]"
+            if isinstance(body, (NumberLiteral, BooleanLiteral)):
+                return f"[{self.expression(body)}]"
+            if isinstance(body, StringLiteral):
+                return f"[*{self.expression(body)}]"
             return self.vector_segment(element)
         if any(
             isinstance(element, ListCompLet)
             or (
                 isinstance(element, ListCompEach)
-                and not isinstance(element.body, ListComprehension)
+                and not isinstance(
+                    _uncommented_expression(element.body), ListComprehension
+                )
             )
             for element in elements
         ):
@@ -3133,7 +3512,9 @@ class _Translator:
             bound.add(assignment.name.name)
         return True
 
-    def c_for_segment(self, element: ListCompCFor, clauses: list[str]) -> str:
+    def c_for_segment(
+        self, element: ListCompCFor, clauses: list[str], each_depth: int = 0
+    ) -> str:
         initial_names = list(
             dict.fromkeys(assignment.name.name for assignment in element.inits)
         )
@@ -3153,7 +3534,7 @@ class _Translator:
             assigned.add(assignment.name.name)
         seed_names = list(dict.fromkeys(n for n in update_names if n in needed))
 
-        simple = self.simple_c_for_segment(element, clauses)
+        simple = self.simple_c_for_segment(element, clauses, each_depth)
         if simple is not None:
             return simple
 
@@ -3195,7 +3576,7 @@ class _Translator:
 
         with self.bind_expression_names(state_names):
             condition = self.expression(element.condition)
-            body = self.vector_segment(element.body)
+            body = self.vector_segment(element.body, each_depth=each_depth)
             updates = []
             update_bindings: list[str] = []
             for index, assignment in enumerate(element.incrs):
@@ -3311,7 +3692,7 @@ class _Translator:
         return result
 
     def simple_c_for_segment(
-        self, element: ListCompCFor, clauses: list[str]
+        self, element: ListCompCFor, clauses: list[str], each_depth: int = 0
     ) -> str | None:
         if (
             len(element.inits) != 1
@@ -3375,10 +3756,13 @@ class _Translator:
         iterator += ")"
         with self.bind_expression_names([name]):
             return self.vector_segment(
-                element.body, [*clauses, f"for {name} in {iterator}"]
+                element.body, [*clauses, f"for {name} in {iterator}"], each_depth
             )
 
-    def vector_segment(self, element: object, clauses: list[str] | None = None) -> str:
+    def vector_segment(
+        self, element: object, clauses: list[str] | None = None, each_depth: int = 0
+    ) -> str:
+        element = _uncommented_expression(element)
         clauses = list(clauses or [])
         if isinstance(element, ListCompFor):
             names: list[str] = []
@@ -3389,7 +3773,7 @@ class _Translator:
                     )
                 names.append(assignment.name.name)
             with self.bind_expression_names(names):
-                return self.vector_segment(element.body, clauses)
+                return self.vector_segment(element.body, clauses, each_depth)
         if isinstance(element, ListCompIf):
             if not any(clause.startswith("for ") for clause in clauses):
                 dummy = "_scadtopy_dummy"
@@ -3399,8 +3783,10 @@ class _Translator:
                     dummy += "_"
                 clauses.insert(0, f"for {dummy} in [None]")
             clauses.append(f"if ({self.expression(element.condition)})")
-            return self.vector_segment(element.true_expr, clauses)
+            return self.vector_segment(element.true_expr, clauses, each_depth)
         if isinstance(element, ListCompIfElse):
+            true_expr = _uncommented_expression(element.true_expr)
+            false_expr = _uncommented_expression(element.false_expr)
             controls = (
                 ListCompEach,
                 ListCompCFor,
@@ -3409,12 +3795,14 @@ class _Translator:
                 ListCompIfElse,
                 ListCompLet,
             )
-            if isinstance(element.true_expr, controls) or isinstance(
-                element.false_expr, controls
+            if (
+                each_depth
+                or isinstance(true_expr, controls)
+                or isinstance(false_expr, controls)
             ):
                 condition = self.expression(element.condition)
-                true_value = self.vector_segment(element.true_expr)
-                false_value = self.vector_segment(element.false_expr)
+                true_value = self.vector_segment(true_expr, each_depth=each_depth)
+                false_value = self.vector_segment(false_expr, each_depth=each_depth)
                 value = f"({true_value} if {condition} else {false_value})"
                 if not clauses:
                     return value
@@ -3425,9 +3813,9 @@ class _Translator:
                     item += "_"
                 return f"[{item} {' '.join(clauses)} for {item} in {value}]"
             value = (
-                f"({self.vector_element_value(element.true_expr)} if "
+                f"({self.expression(true_expr)} if "
                 f"{self.expression(element.condition)} else "
-                f"{self.vector_element_value(element.false_expr)})"
+                f"{self.expression(false_expr)})"
             )
             return f"[{value} {' '.join(clauses)}]".rstrip()
         if isinstance(element, (LetOp, ListCompLet)) and self.comprehension_let_is_safe(
@@ -3441,13 +3829,17 @@ class _Translator:
                     )
                 names.append(assignment.name.name)
             with self.bind_expression_names(names):
-                return self.vector_segment(element.body, clauses)
+                return self.vector_segment(element.body, clauses, each_depth)
         if isinstance(element, ListCompLet):
             with self.bind_expression_names(a.name.name for a in element.assignments):
-                value = self.vector_segment(element.body, clauses)
+                value = self.vector_segment(element.body, clauses, each_depth)
             return self.let_expression(element.assignments, value)
         if isinstance(element, ListCompEach):
-            value = self.vector_element_value(element.body)
+            return self.vector_segment(element.body, clauses, each_depth + 1)
+        if isinstance(element, ListCompCFor):
+            return self.c_for_segment(element, clauses, each_depth)
+        value = self.expression(element)
+        if each_depth:
             self.each_counter += 1
             name = f"_scadtopy_each_{self.each_counter}"
             while name in self.user_identifiers or name in self.imported_identifiers:
@@ -3462,33 +3854,17 @@ class _Translator:
                 "        return [*value]\n"
                 "    return [value]"
             )
-            value = f"{name}({value})"
-            if clauses:
-                item = "_scadtopy_each_item"
+            if each_depth == 1 and not clauses:
+                return f"{name}({value})"
+            for index in range(each_depth):
+                item = f"{name}_item_{index}"
                 while (
                     item in self.user_identifiers or item in self.imported_identifiers
                 ):
                     item += "_"
-                return f"[{item} {' '.join(clauses)} for {item} in ({value})]"
-            return value
-        if isinstance(element, ListCompCFor):
-            return self.c_for_segment(element, clauses)
-        value = self.vector_element_value(element)
+                clauses.append(f"for {item} in {name}({value})")
+                value = item
         return f"[{value} {' '.join(clauses)}]".rstrip()
-
-    def vector_element_value(self, element: object) -> str:
-        if isinstance(
-            element,
-            (ListCompCFor, ListCompFor, ListCompIf, ListCompIfElse, ListCompLet),
-        ):
-            segment = self.vector_segment(element)
-            self.note_fixme(
-                element, "nested list-comprehension control is approximated"
-            )
-            return segment
-        if isinstance(element, ListCompEach):
-            return self.vector_element_value(element.body)
-        return self.expression(element)
 
     def expression(self, node: object) -> str:
         return _tidy(self._expression(node))
@@ -3572,6 +3948,12 @@ class _Translator:
             return f"{receiver}.{node.member.name}"
 
         name = _node_name(node)
+        if isinstance(node, AdditionOp) and not (
+            _literal_number(_uncommented_expression(node.left)) is not None
+            or _literal_number(_uncommented_expression(node.right)) is not None
+        ):
+            self.uses_add_helper = True
+            return f"{self.add_helper}({self.expression(node.left)}, {self.expression(node.right)})"
         if name in _BINARY_OPERATORS:
             return (
                 f"({self.expression(node.left)} {_BINARY_OPERATORS[name]} "
@@ -3591,7 +3973,7 @@ class _Translator:
                 f"{self.expression(node.condition)} else "
                 f"{self.expression(node.false_expr)})"
             )
-        self.note_fixme(node, f"{name} expression is not translated")
+        self.note_unsupported(node, f"{name} expression is not translated")
         return "None"
 
     def unsupported(self, node: object) -> None:
