@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import io
 import math
+import subprocess
 import sys
 import tempfile
 import types
 import unittest
 import warnings
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
@@ -56,6 +57,368 @@ class TranslatorTests(unittest.TestCase):
         self.assertIn("return cube([width, width, width])", generated)
         self.assertIn("box(12.0)", generated)
         compile(generated, "<generated>", "exec")
+
+    def test_missing_required_arguments_are_translation_errors(self) -> None:
+        for source, expected in (
+            ("module buzzer(d, hole_d) cube(d); buzzer(13);", "hole_d"),
+            ("function f(a, b=2, c) = a; result=f(a=1);", "c"),
+            ("function f(a, b) = a; result=f();", "a, b"),
+            ("module outer() { module inner(a) cube(1); inner(); } outer();", "a"),
+        ):
+            with self.subTest(source=source):
+                with self.assertRaisesRegex(
+                    TranslationError,
+                    rf"missing required argument\(s\): {expected}.*line",
+                ):
+                    self.translate(source)
+
+    def test_missing_required_arguments_in_used_module_are_translation_errors(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "lib.scad").write_text(
+                "module buzzer(d, hole_d) cube(d);", encoding="utf-8"
+            )
+            source = root / "main.scad"
+            source.write_text("use <lib.scad>\nbuzzer(13);", encoding="utf-8")
+            with self.assertRaisesRegex(
+                TranslationError, r"main.scad: buzzer\(\).*hole_d"
+            ):
+                translate_file(source)
+            errors = io.StringIO()
+            with patch.object(sys, "argv", ["scadtopy", str(source)]):
+                with redirect_stderr(errors):
+                    self.assertEqual(main(), 1)
+            self.assertIn(
+                "buzzer() missing required argument(s): hole_d", errors.getvalue()
+            )
+            self.assertFalse(source.with_suffix(".py").exists())
+
+    def test_required_argument_validation_preserves_defaults_and_shadowing(
+        self,
+    ) -> None:
+        generated = self.translate("""
+            function f(a) = a;
+            function apply(f) = f();
+            result = apply(function() 7);
+            module box(a, b=2) cube([a,b,1]);
+            box(b=3, a=4);
+            """)
+        namespace: dict[str, object] = {}
+        exec(generated, namespace)
+        self.assertEqual(namespace["result"], 7)
+        self.assertEqual(namespace["_parts"][0].bounding_box(), (0, 0, 0, 4, 3, 1))
+
+    def test_python_keywords_are_renamed_without_collisions(self) -> None:
+        generated = self.translate("""
+            or = 2; _or = 3; __or = 4;
+            function in(or, _or) = let(in=or+_or) in;
+            function total() = or + _or + __or;
+            values = [for(or=[1,2]) let(in=or+1) in];
+            cvalues = [for(or=0; or<2; or=or+1) or];
+            result = in(or=or, _or=_or) + total();
+            module ring(or) { in = or; cube(in); }
+            ring(or=2);
+            """)
+        namespace: dict[str, object] = {}
+        exec(generated, namespace)
+        self.assertEqual(namespace["result"], 14)
+        self.assertEqual(namespace["values"], [2, 3])
+        self.assertEqual(namespace["cvalues"], [0, 1])
+        self.assertEqual(namespace["_parts"][0].bounding_box(), (0, 0, 0, 2, 2, 2))
+        self.assertIn("def _in(_or, __or):", generated)
+
+    def test_python_keyword_names_are_imported_from_used_files(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "lib.scad").write_text(
+                "function in(or) = or + 1; module or(in) cube(in);",
+                encoding="utf-8",
+            )
+            (root / "main.scad").write_text(
+                "use <lib.scad>\nresult=in(or=2); or(in=result);",
+                encoding="utf-8",
+            )
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                library = translate_file(root / "lib.scad")
+                main = translate_file(root / "main.scad")
+        lib = types.ModuleType("lib")
+        with patch.dict(sys.modules, {"lib": lib}):
+            exec(library, lib.__dict__)
+            namespace: dict[str, object] = {}
+            exec(main, namespace)
+        self.assertEqual(namespace["result"], 3)
+        self.assertEqual(namespace["_parts"][0].bounding_box(), (0, 0, 0, 3, 3, 3))
+
+    def test_python_keyword_names_propagate_through_nested_use(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "leaf.scad").write_text(
+                "function in(or) = or + $fn;", encoding="utf-8"
+            )
+            (root / "lib.scad").write_text("use <leaf.scad>", encoding="utf-8")
+            (root / "main.scad").write_text(
+                "use <lib.scad>\n$fn=4; result=in(or=2, $fn=8);", encoding="utf-8"
+            )
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                leaf = translate_file(root / "leaf.scad")
+                library = translate_file(root / "lib.scad")
+                main = translate_file(root / "main.scad")
+        leaf_module, lib_module = types.ModuleType("leaf"), types.ModuleType("lib")
+        with patch.dict(sys.modules, {"leaf": leaf_module, "lib": lib_module}):
+            exec(leaf, leaf_module.__dict__)
+            exec(library, lib_module.__dict__)
+            namespace: dict[str, object] = {}
+            exec(main, namespace)
+        self.assertEqual(namespace["result"], 10)
+
+    def test_conditional_module_loop_iterables(self) -> None:
+        generated = self.translate("""
+            for (x=true ? [1, 2] : [3], y=x==1 ? [4] : [5])
+                translate([x, y, 0]) cube(1);
+            """)
+        namespace: dict[str, object] = {}
+        exec(generated, namespace)
+        self.assertEqual(namespace["_parts"][0].bounding_box(), (1, 4, 0, 3, 6, 1))
+
+    def test_nested_conditional_expressions_preserve_grouping(self) -> None:
+        generated = self.translate("""
+            condition = (true ? false : true) ? 1 : 2;
+            branch = true ? (false ? 1 : 2) : 3;
+            items = [for (x=[0:1]) if (x==0 ? true : false) 4 else 5];
+            if (true ? false : true) cube(1); else cube(2);
+            """)
+        namespace: dict[str, object] = {}
+        exec(generated, namespace)
+        self.assertEqual(namespace["condition"], 2)
+        self.assertEqual(namespace["branch"], 2)
+        self.assertEqual(namespace["items"], [4, 5])
+        self.assertEqual(namespace["_parts"][0].bounding_box(), (0, 0, 0, 2, 2, 2))
+
+    def test_duplicate_parameters_use_the_last_supplied_value(self) -> None:
+        generated = self.translate("""
+            function f(a=4, a=5, b=7) = [a,b];
+            function g(a,a,a) = a;
+            f0 = f();
+            f1 = f(1);
+            f2 = f(1,2,3);
+            f3 = f(1,undef);
+            f4 = f(a=9);
+            f5 = g(1,2,3);
+            callback = function(a,a) a;
+            f6 = callback(1,2);
+            f7 = f(1,a=9);
+            f8 = f(a=9,3);
+            f9 = f(a=1,a=2);
+            f10 = callback(1,a=5);
+            function segment($fn,$fn,a) = [$fn,a];
+            f11 = segment($fn=8,3);
+            module box(d,d) cube(d);
+            box(2,3);
+            box(2,d=4);
+            """)
+        namespace: dict[str, object] = {}
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            exec(generated, namespace)
+        self.assertEqual(namespace["f0"], [4, 7])
+        self.assertEqual(namespace["f1"], [1, 7])
+        self.assertEqual(namespace["f2"], [2, 3])
+        self.assertEqual(namespace["f3"], [None, 7])
+        self.assertEqual(namespace["f4"], [9, 7])
+        self.assertEqual(namespace["f5"], 3)
+        self.assertEqual(namespace["f6"], 2)
+        self.assertEqual(namespace["f7"], [9, 7])
+        self.assertEqual(namespace["f8"], [9, 3])
+        self.assertEqual(namespace["f9"], [2, 7])
+        self.assertEqual(namespace["f10"], 5)
+        self.assertEqual(namespace["f11"], [8, 3])
+        self.assertEqual(len(caught), 4)
+        self.assertEqual(namespace["_parts"][0].bounding_box(), (0, 0, 0, 3, 3, 3))
+        self.assertEqual(namespace["_parts"][1].bounding_box(), (0, 0, 0, 4, 4, 4))
+
+    def test_circle_radius_and_diameter_select_defined_value_once(self) -> None:
+        generated = self.translate("""
+            circle(r=echo("radius") 3, d=echo("diameter") undef, $fn=8);
+            sphere(d=echo("diameter") 8, r=echo("radius") 3, $fn=8);
+            """)
+        namespace: dict[str, object] = {}
+        output = io.StringIO()
+        with redirect_stdout(output), warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            exec(generated, namespace)
+        self.assertEqual(
+            output.getvalue().splitlines(), ["radius", "diameter", "diameter", "radius"]
+        )
+        self.assertEqual(namespace["_parts"][0].bounding_box(), (-3, -3, 3, 3))
+        self.assertEqual(namespace["_parts"][1].bounding_box(), (-4, -4, -4, 4, 4, 4))
+        self.assertTrue(any("Ignoring radius" in str(item.message) for item in caught))
+
+    def test_logical_not_in_comparison_operand(self) -> None:
+        generated = self.translate("result = 2 != !!1;")
+        namespace: dict[str, object] = {}
+        exec(generated, namespace)
+        self.assertTrue(namespace["result"])
+
+    def test_function_segment_overrides_propagate_and_are_scoped(self) -> None:
+        generated = self.translate("""
+            $fn=4; $fa=8; $fs=2;
+            function leaf() = [$fn, $fa, $fs];
+            function outer() = leaf();
+            first = outer($fn=6, $fa=3, $fs=1);
+            second = outer();
+            module box() cube(leaf()[0]);
+            box($fn=7);
+            """)
+        namespace: dict[str, object] = {}
+        exec(generated, namespace)
+        self.assertEqual(namespace["first"], [6, 3, 1])
+        self.assertEqual(namespace["second"], [4, 8, 2])
+        self.assertEqual(namespace["_parts"][0].bounding_box(), (0, 0, 0, 7, 7, 7))
+
+    def test_function_explicit_segment_parameter(self) -> None:
+        generated = self.translate("""
+            $fn=4;
+            function f($fn=5) = $fn;
+            first=f($fn=8); second=f(); third=f(7);
+            """)
+        namespace: dict[str, object] = {}
+        exec(generated, namespace)
+        self.assertEqual(
+            [namespace[n] for n in ("first", "second", "third")], [8, 5, 7]
+        )
+
+    def test_function_values_accept_segment_overrides(self) -> None:
+        generated = self.translate("""
+            $fn=4;
+            function f(value) = value + $fn;
+            function explicit($fn=5) = $fn;
+            functions=[f, function(value) value+$fn, explicit,
+                       function($fn=6) $fn];
+            first=functions[0](2, $fn=8);
+            second=sin(30, $fn=8);
+            third=functions[1](2, $fn=9);
+            fourth=functions[2]($fa=9);
+            fifth=functions[2](7, $fa=9);
+            sixth=functions[3]($fa=9);
+            function apply(callback) = callback(1);
+            function make(callback) = function() callback(1);
+            made=make(f);
+            module box() cube(apply(functions[0]));
+            box($fn=7);
+            module other_box() cube(made());
+            other_box($fn=9);
+            """)
+        namespace: dict[str, object] = {}
+        exec(generated, namespace)
+        self.assertEqual(namespace["first"], 10)
+        self.assertAlmostEqual(namespace["second"], 0.5)
+        self.assertEqual(namespace["third"], 11)
+        self.assertEqual(namespace["fourth"], 5)
+        self.assertEqual(namespace["fifth"], 7)
+        self.assertEqual(namespace["sixth"], 6)
+        self.assertEqual(namespace["_parts"][0].bounding_box(), (0, 0, 0, 8, 8, 8))
+        self.assertEqual(namespace["_parts"][1].bounding_box(), (0, 0, 0, 10, 10, 10))
+
+    def test_builtin_function_segment_arguments_do_not_change_results(self) -> None:
+        generated = self.translate("""
+            first=is_undef(2, $fn=8);
+            second=concat([1], [2], $fn=8);
+            """)
+        namespace: dict[str, object] = {}
+        exec(generated, namespace)
+        self.assertFalse(namespace["first"])
+        self.assertEqual(namespace["second"], [1, 2])
+
+    def test_function_segment_argument_evaluation_order(self) -> None:
+        generated = self.translate("""
+            function value(label, result) = echo(label) result;
+            function f(x) = x + $fn;
+            callback=f;
+            first=f(value("a", 1), $fn=value("b", 8));
+            second=callback(value("c", 2), $fn=value("d", 9));
+            third=is_undef(value("e", 3), $fn=value("f", 10));
+            """)
+        output = io.StringIO()
+        namespace: dict[str, object] = {}
+        with redirect_stdout(output):
+            exec(generated, namespace)
+        self.assertEqual(output.getvalue(), "a\nb\nc\nd\ne\nf\n")
+        self.assertEqual(namespace["first"], 9)
+        self.assertEqual(namespace["second"], 11)
+        self.assertFalse(namespace["third"])
+
+    def test_used_functions_receive_caller_segment_overrides(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "lib.scad").write_text(
+                "function leaf() = $fn; function outer() = leaf();", encoding="utf-8"
+            )
+            (root / "main.scad").write_text(
+                "use <lib.scad>\n$fn=4; "
+                "first=outer($fn=9); second=outer(); "
+                "module box() cube(outer()); box($fn=7);",
+                encoding="utf-8",
+            )
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                library = translate_file(root / "lib.scad")
+                main = translate_file(root / "main.scad")
+        lib = types.ModuleType("lib")
+        with patch.dict(sys.modules, {"lib": lib}):
+            exec(library, lib.__dict__)
+            namespace: dict[str, object] = {}
+            exec(main, namespace)
+        self.assertEqual(namespace["first"], 9)
+        self.assertEqual(namespace["second"], 4)
+        self.assertEqual(namespace["_parts"][0].bounding_box(), (0, 0, 0, 7, 7, 7))
+
+    def test_segment_loop_bindings_are_scoped(self) -> None:
+        from piecad import sphere
+
+        generated = self.translate("""
+            $fn=6;
+            for (i=[4,5], $fn=i) sphere(1);
+            sphere(1);
+            values = [for ($fn=[7,8]) $fn];
+            after = $fn;
+            """)
+        namespace: dict[str, object] = {}
+        with patch("piecad.sphere", wraps=sphere) as calls:
+            exec(generated, namespace)
+        self.assertEqual(
+            [call.kwargs["segments"] for call in calls.call_args_list], [4, 5, 6]
+        )
+        self.assertEqual(namespace["values"], [7, 8])
+        self.assertEqual(namespace["after"], 6)
+
+    def test_segment_let_bindings_are_scoped(self) -> None:
+        from piecad import sphere
+
+        generated = self.translate("""
+            $fn=4;
+            function f()=$fn;
+            first=let($fn=8) f();
+            values=[for(i=[5,6]) let($fn=i) $fn];
+            repeated=[for(i=[5,6]) let($fn=i) each [$fn,$fn]];
+            filtered=[for(i=[5,6]) let($fn=i) if(true) $fn];
+            let($fn=7) sphere(1);
+            sphere(1);
+            after=$fn;
+            """)
+        namespace: dict[str, object] = {}
+        with patch("piecad.sphere", wraps=sphere) as calls:
+            exec(generated, namespace)
+        self.assertEqual([namespace[n] for n in ("first", "after")], [8, 4])
+        self.assertEqual(namespace["values"], [5, 6])
+        self.assertEqual(namespace["repeated"], [5, 5, 6, 6])
+        self.assertEqual(namespace["filtered"], [5, 6])
+        self.assertEqual(
+            [call.kwargs["segments"] for call in calls.call_args_list], [7, 4]
+        )
 
     def test_module_segment_parameters_are_only_added_when_needed(self) -> None:
         generated = self.translate("""
@@ -184,13 +547,45 @@ class TranslatorTests(unittest.TestCase):
             cylinder,
         )
         self.assertIn(
-            "elliptical_cylinder(12.0, (2.0, 4.0), segments=",
+            "cone(12.0, 2.0, 4.0, segments=",
             tapered,
         )
         self.assertNotIn("eliptical_cylinder", cylinder)
         compile(circle, "<generated-circle>", "exec")
         compile(cylinder, "<generated-cylinder>", "exec")
         compile(tapered, "<generated-tapered-cylinder>", "exec")
+
+    def test_positional_tapered_cylinders_and_named_radius_overrides(self) -> None:
+        generated = self.translate("""
+            cylinder(8, 3, 1, $fn=32);
+            cylinder(8, 3, 1, true, $fn=32);
+            cylinder(8, 3, 1, r2=2, $fn=32);
+            cylinder(h=8, r1=3, $fn=32);
+            """)
+        namespace: dict[str, object] = {}
+        exec(generated, namespace)
+        parts = namespace["_parts"]
+        self.assertEqual(parts[0].bounding_box(), (-3, -3, 0, 3, 3, 8))
+        self.assertEqual(parts[1].bounding_box(), (-3, -3, -4, 3, 3, 4))
+        self.assertGreater(parts[2].volume(), parts[0].volume())
+        self.assertEqual(parts[3].bounding_box(), parts[0].bounding_box())
+
+    def test_tapered_cylinder_with_zero_bottom_and_dynamic_radii(self) -> None:
+        generated = self.translate("""
+            _scadtopy_cone = 9;
+            cylinder(8, 0, 3, $fn=32);
+            cylinder(8, 0, 3, true, $fn=32);
+            cylinder(8, echo("bottom") 3, echo("top") 1, $fn=32);
+            """)
+        namespace: dict[str, object] = {}
+        output = io.StringIO()
+        with redirect_stdout(output):
+            exec(generated, namespace)
+        parts = namespace["_parts"]
+        self.assertEqual(parts[0].bounding_box(), (-3, -3, 0, 3, 3, 8))
+        self.assertEqual(parts[1].bounding_box(), (-3, -3, -4, 3, 3, 4))
+        self.assertEqual(output.getvalue().splitlines(), ["bottom", "top"])
+        self.assertEqual(namespace["_scadtopy_cone"], 9)
 
     def test_default_fn_uses_openscad_auto_segments(self) -> None:
         from piecad import Config, sphere
@@ -228,6 +623,20 @@ class TranslatorTests(unittest.TestCase):
             [8, 16, 6],
         )
 
+    def test_segment_defaults_use_piecad_edge_length(self) -> None:
+        from piecad import Config, sphere
+
+        generated = self.translate("sphere(5);")
+        with (
+            patch.object(Config, "get_default_min_edge_length", return_value=1),
+            patch("piecad.sphere", wraps=sphere) as sphere_call,
+        ):
+            exec(generated, {})
+        self.assertEqual(
+            sphere_call.call_args.kwargs["segments"],
+            Config.calc_segs(5, Config.get_default_min_angle(), 1),
+        )
+
     def test_segment_explicit_undef_does_not_use_translated_default(self) -> None:
         from piecad import Config
 
@@ -236,8 +645,8 @@ class TranslatorTests(unittest.TestCase):
 
         with patch.object(
             Config,
-            "calculate_default_segments",
-            wraps=Config.calculate_default_segments,
+            "calc_segs",
+            wraps=Config.calc_segs,
         ) as calculate:
             exec(generated, {})
         self.assertEqual(calculate.call_args.args, (5.0, None, 1.0))
@@ -254,8 +663,8 @@ class TranslatorTests(unittest.TestCase):
         self.assertIn("_scadtopy_calculate_segments(5.0, fs=2.0)", generated)
         with patch.object(
             Config,
-            "calculate_default_segments",
-            wraps=Config.calculate_default_segments,
+            "calc_segs",
+            wraps=Config.calc_segs,
         ) as calculate:
             exec(generated, {})
         self.assertEqual(
@@ -344,13 +753,69 @@ class TranslatorTests(unittest.TestCase):
         )
         compile(generated, "<generated-unsupported-special-definitions>", "exec")
 
+    def test_user_special_variables_are_reported_and_ignored(self) -> None:
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            generated = self.translate("""
+                $layer_height = 0.2;
+                height = is_undef($layer_height) ? 0.25 : $layer_height;
+                cube(height);
+                """)
+        self.assertTrue(any("UNSUPPORTED" in str(w.message) for w in caught))
+        self.assertTrue(any("$layer_height" in str(w.message) for w in caught))
+        self.assertIn("UNSUPPORTED", generated)
+        namespace: dict[str, object] = {}
+        exec(generated, namespace)
+        self.assertEqual(namespace["height"], 0.25)
+        self.assertAlmostEqual(namespace["_parts"][0].volume(), 0.25**3)
+
+    def test_calling_unsupported_special_variables_returns_undef(self) -> None:
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            generated = self.translate("""
+                function value() = $callback(3);
+                result = is_undef(value());
+                """)
+        self.assertTrue(any("$callback" in str(w.message) for w in caught))
+        namespace: dict[str, object] = {}
+        exec(generated, namespace)
+        self.assertTrue(namespace["result"])
+
+    def test_ignoring_user_special_bindings_preserves_other_geometry(self) -> None:
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            generated = self.translate("""
+                module part($custom=5) {
+                    $local = 4;
+                    cube(2);
+                }
+                function value(a=1, $custom=2) = a;
+                values = [for ($i=[0:1]) 4];
+                from_let = let($option=3) is_undef($option) ? 5 : $option;
+                checked = let($option=3) assert(true) 7;
+                unsupported_loop = [for ($i=0; $i<2; $i=$i+1) $i];
+                part($custom=6);
+                cube(value(3, $custom=7));
+                for ($i=[0:1]) cube(1);
+                assign($custom=4) cube(1);
+                """)
+        for name in ("$custom", "$local", "$i"):
+            self.assertTrue(any(name in str(w.message) for w in caught))
+        namespace: dict[str, object] = {}
+        exec(generated, namespace)
+        self.assertEqual(namespace["values"], [4, 4])
+        self.assertEqual(namespace["from_let"], 5)
+        self.assertEqual(namespace["checked"], 7)
+        self.assertEqual(namespace["unsupported_loop"], [])
+        self.assertEqual([part.volume() for part in namespace["_parts"]], [8, 27, 1, 1])
+
     def test_calculates_segments_from_min_angle_and_segment_length(self) -> None:
         generated = self.translate(
             "$fa=6; $fs=1; function min_angle()=$fa; "
             "sphere(r=5, $fn=0, $fa=min_angle(), $fs=$fs);"
         )
 
-        self.assertIn("def min_angle():\n    return _scadtopy_default_fa", generated)
+        self.assertIn("def min_angle(_scadtopy_special_fa=None):", generated)
         self.assertIn(
             "segments=_scadtopy_calculate_segments("
             "5.0, fn=int(0.0), fa=min_angle())",
@@ -360,14 +825,14 @@ class TranslatorTests(unittest.TestCase):
         from piecad import Config
 
         original_angle = Config.get_default_min_angle()
-        original_length = Config.get_default_min_segment_length()
+        original_length = Config.get_default_min_edge_length()
         try:
             exec(generated, namespace)
             self.assertGreater(namespace["_parts"][0].num_verts(), 0)
-            self.assertEqual(Config.calculate_default_segments(5, 6, 1), 32)
+            self.assertEqual(Config.calc_segs(5, 6, 1), 32)
         finally:
             Config.set_default_min_angle(original_angle)
-            Config.set_default_min_segment_length(original_length)
+            Config.set_default_min_edge_length(original_length)
 
     def test_scoped_segment_settings_in_modules(self) -> None:
         generated = self.translate(
@@ -709,7 +1174,7 @@ class TranslatorTests(unittest.TestCase):
             result = calculate(3);
             """)
         self.assertIn(
-            "def calculate(x):\n    a = x + 1.0\n    b = a * 2.0\n"
+            "def calculate(x):\n    a = x + 1.0\n    b = _scadtopy_multiply(a, 2.0)\n"
             "    return _scadtopy_add(a, b)",
             generated,
         )
@@ -1390,9 +1855,11 @@ class TranslatorTests(unittest.TestCase):
             """)
 
         compile(generated, "<generated-modules>", "exec")
-        self.assertIn("union(*[", generated)
         self.assertIn("if True else", generated)
         self.assertIn("lambda size:", generated)
+        namespace: dict[str, object] = {}
+        exec(generated, namespace)
+        self.assertEqual(namespace["_parts"][0].bounding_box(), (0, 0, 0, 3, 1, 1))
 
     def test_assign_bindings_are_independent_and_scoped(self) -> None:
         generated = self.translate("""
@@ -1459,13 +1926,15 @@ class TranslatorTests(unittest.TestCase):
 
     def test_assign_reports_unsupported_special_bindings(self) -> None:
         with self.assertWarnsRegex(
-            UserWarning, r"UNSUPPORTED: assign\(\) binding \$custom"
+            UserWarning, r"UNSUPPORTED: special variable \$custom argument is ignored"
         ):
             generated = self.translate("assign($custom=2) cube(1);")
         self.assertIn(
-            "UNSUPPORTED: assign() binding $custom is not translated", generated
+            "UNSUPPORTED: special variable $custom argument is ignored", generated
         )
-        compile(generated, "<generated-assign>", "exec")
+        namespace: dict[str, object] = {}
+        exec(generated, namespace)
+        self.assertEqual(namespace["_parts"][0].volume(), 1)
 
     def test_assign_reports_bindings_that_shadow_geometry_calls(self) -> None:
         with self.assertWarnsRegex(UserWarning, "assign\\(\\) bindings shadow"):
@@ -1614,7 +2083,7 @@ class TranslatorTests(unittest.TestCase):
         self.assertNotIn("child geometry for module 'minkowski'", generated)
         self.assertIn("for index in reversed(path)", generated)
         self.assertIn("face[i + 1], face[i]", generated)
-        self.assertIn("elliptical_cylinder(", generated)
+        self.assertIn("cone(", generated)
         compile(generated, "<generated-t-scad>", "exec")
 
         output = io.StringIO()
@@ -1770,11 +2239,64 @@ class TranslatorTests(unittest.TestCase):
         exec(generated, namespace)
         self.assertAlmostEqual(namespace["_parts"][0].bounding_box()[5], 1.0)
 
-    def test_required_parameter_after_default_gets_undef_default(self) -> None:
+    def test_cube_and_linear_extrude_use_openscad_defaults(self) -> None:
+        generated = self.translate(
+            "cube(center=true); linear_extrude(center=true) square(2);"
+        )
+        namespace: dict[str, object] = {}
+        exec(generated, namespace)
+        cube, extruded = namespace["_parts"]
+        self.assertEqual(cube.bounding_box(), (-0.5, -0.5, -0.5, 0.5, 0.5, 0.5))
+        self.assertEqual(extruded.bounding_box(), (0, 0, -50, 2, 2, 50))
+
+    def test_boolean_and_color_scope_segment_settings_for_children(self) -> None:
+        from piecad import Config, sphere
+
+        generated = self.translate("""
+            module shape() {
+                hull($fn=echo("fn") 8) {
+                    radius = 1;
+                    sphere(radius);
+                    translate([2,0,0]) sphere(radius);
+                }
+            }
+            shape();
+            color(c=echo("color") "red", $fs=echo("fs") 0.1) sphere(1);
+            """)
+        namespace: dict[str, object] = {}
+        output = io.StringIO()
+        with patch("piecad.sphere", wraps=sphere) as make_sphere:
+            with redirect_stdout(output):
+                exec(generated, namespace)
+        self.assertEqual(output.getvalue().splitlines(), ["fn", "color", "fs"])
+        self.assertEqual(
+            [call.kwargs["segments"] for call in make_sphere.call_args_list],
+            [
+                8,
+                8,
+                Config.calc_segs(1, Config.get_default_min_angle(), 0.1),
+            ],
+        )
+
+    def test_boolean_convexity_is_evaluated_but_ignored(self) -> None:
+        generated = self.translate("""
+            intersection(convexity=echo("convexity") 2) {
+                cube(2);
+                cube(3);
+            }
+            """)
+        output = io.StringIO()
+        namespace: dict[str, object] = {}
+        with redirect_stdout(output):
+            exec(generated, namespace)
+        self.assertEqual(output.getvalue().splitlines(), ["convexity"])
+        self.assertEqual(namespace["_parts"][0].volume(), 8)
+
+    def test_required_parameter_after_default_can_be_supplied_by_name(self) -> None:
         generated = self.translate(
             "module m(a, b=2, c) { cube(a + b); }\n"
             "function f(a=1, b) = a;\n"
-            "m(1); echo(f());\n"
+            "m(1, c=3); echo(f(b=2));\n"
         )
 
         self.assertIn("def m(a, b=2.0, c=None", generated)
@@ -1934,8 +2456,8 @@ class TranslatorTests(unittest.TestCase):
         with (
             patch.object(
                 Config,
-                "calculate_default_segments",
-                wraps=Config.calculate_default_segments,
+                "calc_segs",
+                wraps=Config.calc_segs,
             ) as calculate,
             patch("piecad.extrude_transforming", wraps=extrude_transforming) as extrude,
         ):
@@ -2044,26 +2566,77 @@ class TranslatorTests(unittest.TestCase):
             generated = self.translate("""
                 text("A", font="Liberation Sans", spacing=1.2);
                 text("B", $fn=16, direction="rtl");
-                text("C", 10, "Arial");
                 linear_extrude(3) text("E", language="ar", script="arabic");
                 text("D", size=10);
                 """)
 
-        self.assertIn("# UNSUPPORTED: text() parameter(s) font, spacing", generated)
+        self.assertIn("# UNSUPPORTED: text() parameter(s) spacing", generated)
         self.assertIn("# UNSUPPORTED: text() parameter(s) $fn, direction", generated)
-        self.assertIn(
-            "# UNSUPPORTED: text() parameter(s) positional arguments after size",
-            generated,
-        )
         self.assertIn("# UNSUPPORTED: text() parameter(s) language, script", generated)
         self.assertNotIn("FIXME: text()", generated)
-        self.assertEqual(len(caught), 4)
+        self.assertEqual(len(caught), 3)
         self.assertTrue(
             all("UNSUPPORTED: text()" in str(item.message) for item in caught)
         )
         namespace: dict[str, object] = {}
         exec(generated, namespace)
         self.assertEqual(len(namespace["_parts"]), 1)
+
+    def test_font_resolution_fallback_and_restoration(self) -> None:
+        import subprocess
+        from importlib.resources import files
+
+        from piecad import _fonts, _text
+
+        path = str(files(_fonts) / "Roboto-Regular.ttf")
+        generated = self.translate(
+            'text("A", 10, "Missing Font:style=Bold");'
+            'text("", font="Missing Font:style=Bold", halign="center");'
+        )
+        previous = _text._font
+        match = subprocess.CompletedProcess([], 0, f"Roboto\nRegular\n{path}\n", "")
+        with patch("subprocess.run", return_value=match):
+            with self.assertWarnsRegex(UserWarning, "Missing Font.*using Roboto"):
+                namespace: dict[str, object] = {}
+                exec(generated, namespace)
+        self.assertIs(_text._font, previous)
+        self.assertGreater(namespace["_parts"][0].area(), 0)
+        self.assertTrue(namespace["_parts"][1].is_empty())
+
+        with patch("subprocess.run", return_value=match):
+            with patch("piecad.text_set_font", side_effect=RuntimeError("font error")):
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore", UserWarning)
+                    with self.assertRaisesRegex(RuntimeError, "font error"):
+                        namespace["_scadtopy_text"](
+                            "A", 10, "left", "baseline", "Missing Font"
+                        )
+        self.assertIs(_text._font, previous)
+
+    def test_rotate_absent_module_and_conditional_children(self) -> None:
+        generated = self.translate("""
+            module maybe(enabled) { if (enabled) cube(2); }
+            rotate([0, 90, 0]) scale([1, 1, 1]) maybe(false);
+            rotate(90) if (false) square(2);
+            rotate(90) maybe(true);
+            """)
+        namespace: dict[str, object] = {}
+        exec(generated, namespace)
+        self.assertIsNone(namespace["_parts"][0])
+        self.assertIsNone(namespace["_parts"][1])
+        self.assertAlmostEqual(namespace["_parts"][2].mo.volume(), 8)
+
+    def test_version_num_default_and_explicit_version(self) -> None:
+        generated = self.translate("""
+            default_version = version_num();
+            release = version_num([2020, 12, 9]);
+            short_release = version_num([2015, 3]);
+            """)
+        namespace: dict[str, object] = {}
+        exec(generated, namespace)
+        self.assertEqual(namespace["default_version"], 20210100)
+        self.assertEqual(namespace["release"], 20201209)
+        self.assertEqual(namespace["short_release"], 20150300)
 
     def test_text_without_content_is_reported_as_unsupported(self) -> None:
         with self.assertWarnsRegex(UserWarning, r"UNSUPPORTED: text\(\)"):
@@ -2093,6 +2666,22 @@ class TranslatorTests(unittest.TestCase):
         self.assertEqual(flat.bounding_box(), (0, 0, 3, 1))
         self.assertEqual(flat._color, (0, 255, 0))
         self.assertEqual(repeated.bounding_box(), (0, 0, 0, 5, 2, 2))
+
+    def test_literal_color_on_optional_module_geometry(self) -> None:
+        from piecad import Obj3d
+
+        generated = self.translate("""
+            module shape(enabled) { if (enabled) cube(1); }
+            color([0, 1, 0]) shape(true);
+            color([1, 0.5, 0, 0.2]) shape(true);
+            color([0, 1, 0]) shape(false);
+            """)
+        namespace: dict[str, object] = {}
+        exec(generated, namespace)
+        first, second, empty = namespace["_parts"]
+        self.assertEqual(Obj3d.color_map[first.mo.original_id()], (0, 255, 0))
+        self.assertEqual(Obj3d.color_map[second.mo.original_id()], (255, 128, 0))
+        self.assertIsNone(empty)
 
     def test_color_handles_runtime_vectors_hex_and_no_color(self) -> None:
         generated = self.translate("""
@@ -2134,11 +2723,42 @@ class TranslatorTests(unittest.TestCase):
         self.assertEqual(namespace["_parts"][0]._color, (51, 102, 153))
         self.assertEqual(namespace["_parts"][1]._color, (255, 0, 0))
 
-    def test_color_names_are_passed_unchanged_to_piecad(self) -> None:
+    def test_color_names_are_case_insensitive(self) -> None:
+        generated = self.translate("""
+            name = "SteelBlue";
+            color("DarkSlateGray") square(1);
+            color(name) square(1);
+            color("RED") { square(1); translate([2, 0]) square(1); }
+            """)
+        namespace: dict[str, object] = {}
+        exec(generated, namespace)
+        self.assertEqual(
+            [part._color for part in namespace["_parts"]],
+            [(47, 79, 79), (70, 130, 180), (255, 0, 0)],
+        )
+
+    def test_color_hex_strings_keep_their_case(self) -> None:
+        from piecad import Obj2d
+
+        generated = self.translate("""
+            hex = "#ABCDEF";
+            short_hex = "#AbC";
+            color("#ABCDEF") square(1);
+            color(hex) square(1);
+            color(short_hex) square(1);
+            """)
+        with patch.object(Obj2d, "color", autospec=True) as color:
+            exec(generated, {})
+        self.assertEqual(
+            [call.args[1] for call in color.call_args_list],
+            ["#ABCDEF", "#ABCDEF", "#AAbbCC"],
+        )
+
+    def test_unknown_color_names_still_raise(self) -> None:
         from piecad import ValidationError
 
-        generated = self.translate('color("Red") cube(1);')
-        with self.assertRaises(ValidationError):
+        generated = self.translate('color("NotAColor") square(1);')
+        with self.assertRaisesRegex(ValidationError, "notacolor"):
             exec(generated, {})
 
     def test_color_helper_avoids_user_identifiers(self) -> None:
@@ -2224,13 +2844,88 @@ class TranslatorTests(unittest.TestCase):
         generated = self.translate(
             "module flat() square(2); translate([1, 2, 3]) flat();"
         )
-        self.assertNotIn("_scadtopy_translate", generated)
-        self.assertIn(".translate([1.0, 2.0])", generated)
+        self.assertIn("_scadtopy_translate(flat()", generated)
         namespace: dict[str, object] = {}
         exec(generated, namespace)
 
         model = namespace["_parts"][0]
         self.assertEqual(model.bounding_box(), (1.0, 2.0, 3.0, 4.0))
+
+    def test_translate_two_offsets_for_3d_geometry(self) -> None:
+        generated = self.translate("""
+            module shape(flat) if (flat) square(2); else cube(2);
+            vector = [3, 4];
+            translate([1, 2]) cube(2);
+            translate(vector) cube(2);
+            translate(vector) shape(true);
+            translate(vector) shape(false);
+            """)
+        namespace: dict[str, object] = {}
+        exec(generated, namespace)
+        self.assertEqual(
+            [part.bounding_box() for part in namespace["_parts"]],
+            [(1, 2, 0, 3, 4, 2), (3, 4, 0, 5, 6, 2), (3, 4, 5, 6), (3, 4, 0, 5, 6, 2)],
+        )
+
+    def test_scale_adapts_vectors_scalars_and_runtime_dimensions(self) -> None:
+        generated = self.translate("""
+            module shape(flat) if (flat) square(2); else cube(2);
+            function value(label, result) = echo(label) result;
+            vector = [2, 3, 9];
+            scale([2, 3, value("z", 9)]) square(2);
+            scale([2, 3]) cube(2);
+            scale(2) square(2);
+            scale(value("scalar", 2)) cube(2);
+            scale(vector) shape(true);
+            scale([2, 3]) shape(false);
+            """)
+        namespace: dict[str, object] = {}
+        output = io.StringIO()
+        with redirect_stdout(output):
+            exec(generated, namespace)
+        self.assertEqual(output.getvalue(), "z\nscalar\n")
+        self.assertEqual(
+            [part.bounding_box() for part in namespace["_parts"]],
+            [
+                (0, 0, 4, 6),
+                (0, 0, 0, 4, 6, 2),
+                (0, 0, 4, 4),
+                (0, 0, 0, 4, 4, 4),
+                (0, 0, 4, 6),
+                (0, 0, 0, 4, 6, 2),
+            ],
+        )
+
+    def test_transform_adapters_avoid_user_identifiers_and_reject_bad_vectors(
+        self,
+    ) -> None:
+        from piecad import ValidationError
+
+        generated = self.translate("""
+            _scadtopy_scale = 1; _scadtopy_translate = 2;
+            isinstance = 3; len = 4;
+            module shape() cube(2);
+            translate([1, 2]) scale([2, 3]) shape();
+            """)
+        namespace: dict[str, object] = {}
+        exec(generated, namespace)
+        self.assertEqual(namespace["_parts"][0].bounding_box(), (1, 2, 0, 5, 8, 2))
+        self.assertIn("def _scadtopy_scale_(", generated)
+        self.assertIn("def _scadtopy_translate_(", generated)
+        for expression in ("translate([1]) cube(1);", "scale([1, 2, 3, 4]) cube(1);"):
+            with self.subTest(expression=expression):
+                with self.assertRaises(ValidationError):
+                    exec(self.translate(expression), {})
+
+    def test_scale_and_translate_preserve_absent_geometry(self) -> None:
+        generated = self.translate("""
+            module empty() if (false) cube(1);
+            scale([2, 3]) empty();
+            translate([1, 2]) empty();
+            """)
+        namespace: dict[str, object] = {}
+        exec(generated, namespace)
+        self.assertEqual(namespace["_parts"], [None, None])
 
     def test_translate_preserves_dynamic_dimensions_and_vector_evaluation(self) -> None:
         generated = self.translate("""
@@ -2273,8 +2968,7 @@ class TranslatorTests(unittest.TestCase):
             module wrapped() { flat(true); }
             translate([1,2,3]) wrapped();
             """)
-        self.assertNotIn("_scadtopy_translate", generated)
-        self.assertIn(".translate([1.0, 2.0])", generated)
+        self.assertIn("_scadtopy_translate(wrapped(", generated)
         namespace: dict[str, object] = {}
         exec(generated, namespace)
         self.assertEqual(namespace["_parts"][0].bounding_box(), (1, 2, 3, 4))
@@ -2291,9 +2985,7 @@ class TranslatorTests(unittest.TestCase):
             translate([1, 2, 3]) pair() { cube(1); cube(2); }
             """)
 
-        self.assertEqual(generated.count("_scadtopy_translate("), 2)
         self.assertIn("_scadtopy_translate(_scadtopy_children(_children)", generated)
-        self.assertIn(").translate([1.0, 2.0, 3.0])", generated)
         namespace: dict[str, object] = {}
         exec(generated, namespace)
         self.assertEqual(len(namespace["_parts"]), 3)
@@ -2314,9 +3006,6 @@ class TranslatorTests(unittest.TestCase):
             translate([1, 2, 3]) wrapped() square(2);
             """)
 
-        self.assertEqual(generated.count("_scadtopy_translate("), 2)
-        self.assertIn(".translate([1.0, 2.0])", generated)
-        self.assertIn(".translate([1.0, 2.0, 3.0])", generated)
         namespace: dict[str, object] = {}
         exec(generated, namespace)
         self.assertEqual(namespace["_parts"][0].bounding_box(), (1, 2, 13, 4))
@@ -2403,7 +3092,7 @@ class TranslatorTests(unittest.TestCase):
                 translate([1,2,3]) import("drawing.svg");
                 translate([1,2,3]) import("part.stl");
                 """)
-        self.assertIn("load('drawing.svg').translate([1.0, 2.0])", generated)
+        self.assertIn("load('drawing.svg', svg_openscad=True).translate([1.0, 2.0])", generated)
         self.assertIn("load('part.stl').translate([1.0, 2.0, 3.0])", generated)
         with patch("piecad.load", side_effect=[square(1), cube(1)]):
             namespace: dict[str, object] = {}
@@ -2443,6 +3132,46 @@ class TranslatorTests(unittest.TestCase):
 
         self.assertIn("from lib import *", generated)
         self.assertIn("_parts.append(peg())", generated)
+
+    def test_used_standard_library_names_are_renamed_without_collisions(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            sources = {
+                "math.scad": "function _private()=sqrt(9); function first()=_private();",
+                "_math.scad": "function second()=4;",
+                "json.scad": "function third()=5;",
+                "_json.scad": "function fourth()=6;",
+                "main.scad": (
+                    "use <math.scad> use <_math.scad> "
+                    "use <json.scad> use <_json.scad> "
+                    "result = first()+second()+third()+fourth();"
+                ),
+            }
+            for name, source in sources.items():
+                (root / name).write_text(source, encoding="utf-8")
+                with redirect_stdout(io.StringIO()), warnings.catch_warnings():
+                    warnings.simplefilter("ignore")
+                    with patch("sys.argv", ["scadtopy", str(root / name)]):
+                        self.assertEqual(main_module.main(), 0)
+            for name in ("_math.py", "__math.py", "__json.py", "___json.py"):
+                self.assertTrue((root / name).is_file(), name)
+            generated = (root / "main.py").read_text(encoding="utf-8")
+            self.assertIn("from _math import _private", generated)
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    "-c",
+                    "import main, math, json; "
+                    "assert main.result == 18; "
+                    "assert math.sqrt(9) == 3; "
+                    "assert json.loads('1') == 1",
+                ],
+                cwd=root,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_use_reports_missing_source_and_unresolved_modules(self) -> None:
         with warnings.catch_warnings(record=True) as caught:
@@ -2717,7 +3446,7 @@ class TranslatorTests(unittest.TestCase):
             scalar = 2 + 3;
             function add(x, y) = x + y;
             dynamic_scalar = add(4, 5);
-            tuple_vector = version() + [1, 2, 3];
+            version_vector = version() + [1, 2, 3];
             """)
 
         self.assertIn("scalar = 2.0 + 3.0", generated)
@@ -2726,15 +3455,8 @@ class TranslatorTests(unittest.TestCase):
         self.assertEqual(namespace["result"], [11, [22, 33]])
         self.assertEqual(namespace["literal"], [4, 6])
         self.assertEqual(namespace["dynamic_scalar"], 9)
-        self.assertEqual(
-            namespace["tuple_vector"],
-            [
-                part + increment
-                for part, increment in zip(
-                    map(int, namespace["version"]().split(".")), (1, 2, 3)
-                )
-            ],
-        )
+        self.assertEqual(namespace["version_vector"], [2022, 3])
+        self.assertEqual(namespace["add"]((1, 2), [3, 4]), [4, 6])
 
     def test_vector_addition_evaluates_operands_once_and_avoids_collisions(
         self,
@@ -2770,6 +3492,145 @@ class TranslatorTests(unittest.TestCase):
                 with self.assertRaisesRegex(TypeError, "vector addition requires"):
                     exec(generated, {})
 
+    def test_vector_subtraction_and_negation_are_recursive(self) -> None:
+        generated = self.translate("""
+            vector = [10, [20, 30], 40] - [1, [2, 3, 4]];
+            negated = -[2, [-3, 4]];
+            function negate(value) = -value;
+            scalar = negate(3);
+            """)
+        namespace: dict[str, object] = {}
+        exec(generated, namespace)
+        self.assertEqual(namespace["vector"], [9, [18, 27]])
+        self.assertEqual(namespace["negated"], [-2, [3, -4]])
+        self.assertEqual(namespace["scalar"], -3)
+
+    def test_vector_and_matrix_multiplication(self) -> None:
+        generated = self.translate("""
+            scaled = [1, [2, 3]] * 2;
+            scaled_reverse = 3 * [1, 2];
+            dot = [1, 2] * [3, 4];
+            matrix_vector = [[1, 2, 3], [4, 5, 6]] * [7, 8, 9];
+            vector_matrix = [1, 2] * [[3, 4, 5], [6, 7, 8]];
+            matrix_matrix = [[1, 2], [3, 4]] * [[5, 6, 7], [8, 9, 10]];
+            function multiply(a, b) = a * b;
+            scalar = multiply(3, 4);
+            """)
+        namespace: dict[str, object] = {}
+        exec(generated, namespace)
+        self.assertEqual(namespace["scaled"], [2, [4, 6]])
+        self.assertEqual(namespace["scaled_reverse"], [3, 6])
+        self.assertEqual(namespace["dot"], 11)
+        self.assertEqual(namespace["matrix_vector"], [50, 122])
+        self.assertEqual(namespace["vector_matrix"], [15, 18, 21])
+        self.assertEqual(namespace["matrix_matrix"], [[21, 24, 27], [47, 54, 61]])
+        self.assertEqual(namespace["scalar"], 12)
+
+    def test_vector_arithmetic_evaluates_operands_once_and_avoids_collisions(
+        self,
+    ) -> None:
+        generated = self.translate("""
+            _scadtopy_subtract = 1;
+            _scadtopy_multiply = 2;
+            _scadtopy_negate = 3;
+            function value(label, result) = echo(label) result;
+            difference = value("left", [4, 6]) - value("right", [1, 2]);
+            product = value("vector", [1, 2]) * value("factor", 2);
+            negative = -value("negate", [1, 2]);
+            """)
+        output = io.StringIO()
+        namespace: dict[str, object] = {}
+        with redirect_stdout(output):
+            exec(generated, namespace)
+        self.assertEqual(
+            output.getvalue().splitlines(),
+            ["left", "right", "vector", "factor", "negate"],
+        )
+        self.assertEqual(namespace["difference"], [3, 4])
+        self.assertEqual(namespace["product"], [2, 4])
+        self.assertEqual(namespace["negative"], [-1, -2])
+        self.assertEqual(
+            (
+                namespace["_scadtopy_subtract"],
+                namespace["_scadtopy_multiply"],
+                namespace["_scadtopy_negate"],
+            ),
+            (1, 2, 3),
+        )
+
+    def test_vector_arithmetic_rejects_invalid_components_and_dimensions(self) -> None:
+        for expression in (
+            '[1, "a"] - [2, 3]',
+            "-[1, true]",
+            '[1, "a"] * 2',
+            "[[1], [2, 3]] * [1]",
+        ):
+            with self.subTest(expression=expression):
+                generated = self.translate(f"result = {expression};")
+                with self.assertRaises(TypeError):
+                    exec(generated, {})
+        for expression in ("[1, 2] * [1]", "[[1, 2]] * [[1, 2]]"):
+            with self.subTest(expression=expression):
+                generated = self.translate(f"result = {expression};")
+                with self.assertRaisesRegex(ValueError, "dimensions do not match"):
+                    exec(generated, {})
+
+    def test_vector_division_is_recursive_and_preserves_scalar_division(self) -> None:
+        generated = self.translate("""
+            function divide(value, divisor) = value / divisor;
+            vector = [2, [4, 6], 8, 10] / 2;
+            dynamic = divide([12, 6], 3);
+            scalar = divide(9, 2);
+            empty = [] / 2;
+            reciprocal = 12 / [2, [3, 4]];
+            dynamic_reciprocal = divide(8, [2, 4]);
+            version_vector = version() / 2;
+            """)
+        namespace: dict[str, object] = {}
+        exec(generated, namespace)
+        self.assertEqual(namespace["vector"], [1, [2, 3], 4, 5])
+        self.assertEqual(namespace["dynamic"], [4, 2])
+        self.assertEqual(namespace["scalar"], 4.5)
+        self.assertEqual(namespace["empty"], [])
+        self.assertEqual(namespace["reciprocal"], [6, [4, 3]])
+        self.assertEqual(namespace["dynamic_reciprocal"], [4, 2])
+        self.assertEqual(namespace["version_vector"], [1010.5, 0.5])
+        self.assertEqual(namespace["divide"]((4, 6), 2), [2, 3])
+
+    def test_vector_division_evaluates_operands_once_and_avoids_collisions(
+        self,
+    ) -> None:
+        generated = self.translate("""
+            _scadtopy_divide = 10;
+            list = 1; tuple = 2;
+            function value(label, result) = echo(label) result;
+            result = value("left", [2, 4]) / value("right", 2);
+            """)
+        self.assertIn("def _scadtopy_divide_(", generated)
+        output = io.StringIO()
+        namespace: dict[str, object] = {}
+        with redirect_stdout(output):
+            exec(generated, namespace)
+        self.assertEqual(output.getvalue(), "left\nright\n")
+        self.assertEqual(namespace["result"], [1, 2])
+
+    def test_vector_division_rejects_invalid_components_and_zero(self) -> None:
+        for expression in (
+            '[1, "a"] / 2',
+            "[1, true] / 2",
+            "2 / [1, true]",
+            "[1, 2] / [2, 2]",
+        ):
+            with self.subTest(expression=expression):
+                generated = self.translate(f"result = {expression};")
+                with self.assertRaisesRegex(TypeError, "vector division requires"):
+                    exec(generated, {})
+        for expression in ("[1, 2] / 0", "2 / [1, 0]", "4 / 0"):
+            with self.subTest(expression=expression):
+                generated = self.translate(f"result = {expression};")
+                with self.assertRaises(ZeroDivisionError):
+                    exec(generated, {})
+
     def test_group_and_modifiers(self) -> None:
         generated = self.translate(
             "group() { cube(1); sphere(1); } *cube(5); #cube(2); %sphere(2);"
@@ -2789,10 +3650,26 @@ class TranslatorTests(unittest.TestCase):
         self.assertNotIn("FIXME", generated)
 
     def test_show_only_modifier_is_fatal(self) -> None:
-        with self.assertRaisesRegex(
-            TranslationError, r"Show only \('!'\) is not allowed at line: 2"
+        for source in (
+            "cube(1);\n!cube(2);",
+            "module exclusive() {\n!children(); }",
         ):
-            self.translate("cube(1);\n!cube(2);")
+            with self.subTest(source=source):
+                with self.assertRaisesRegex(
+                    TranslationError,
+                    r"^UNSUPPORTED: Show only \('!'\) is not allowed at line: 2$",
+                ):
+                    self.translate(source)
+
+    def test_cli_rejects_show_only_as_unsupported(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "model.scad"
+            source.write_text("!cube(1);", encoding="utf-8")
+            error = io.StringIO()
+            with redirect_stderr(error), patch("sys.argv", ["scadtopy", str(source)]):
+                self.assertEqual(main_module.main(), 1)
+            self.assertIn("UNSUPPORTED: Show only ('!')", error.getvalue())
+            self.assertFalse(source.with_suffix(".py").exists())
 
     def test_easy_builtins(self) -> None:
         generated = self.translate(
@@ -2840,19 +3717,42 @@ class TranslatorTests(unittest.TestCase):
         with self.assertRaisesRegex(TranslationError, "Unsupported search"):
             self.translate("result = search([1], [1], unknown=0);")
 
-    def test_import_maps_to_piecad_load_and_version_is_a_tuple(self) -> None:
+    def test_import_maps_to_piecad_load(self) -> None:
         generated = self.translate(
             'import("part.stl"); import(file="part.3mf", convexity=2);'
-            'import("drawing.svg"); import("drawing.dxf"); v = version();'
+            'import("drawing.svg"); import("drawing.dxf");'
         )
 
         self.assertIn("_parts.append(load('part.stl'))", generated)
         self.assertIn("_parts.append(load('part.3mf'))", generated)
-        self.assertIn("_parts.append(load('drawing.svg'))", generated)
+        self.assertIn("_parts.append(load('drawing.svg', svg_openscad=True))", generated)
         self.assertIn("_parts.append(load('drawing.dxf'))", generated)
         self.assertNotIn("import() of .svg files is not supported", generated)
         self.assertNotIn("import() of .dxf files is not supported", generated)
-        self.assertIn("v = tuple(map(int, version().split('.')))", generated)
+
+    def test_version_reports_openscad_release_and_evaluates_arguments(self) -> None:
+        generated = self.translate("""
+            _scadtopy_version = 7;
+            function value() = echo("argument") 2;
+            basic = version();
+            with_arguments = version(value(), ignored=value());
+            year = version()[0];
+            """)
+        output = io.StringIO()
+        namespace: dict[str, object] = {}
+        with redirect_stdout(output):
+            exec(generated, namespace)
+        self.assertEqual(namespace["basic"], [2021, 1])
+        self.assertEqual(namespace["with_arguments"], [2021, 1])
+        self.assertEqual(namespace["year"], 2021)
+        self.assertEqual(output.getvalue(), "argument\nargument\n")
+        self.assertIn("def _scadtopy_version_(", generated)
+
+    def test_user_defined_version_function_is_preserved(self) -> None:
+        generated = self.translate("function version(n) = n + 1; result = version(2);")
+        namespace: dict[str, object] = {}
+        exec(generated, namespace)
+        self.assertEqual(namespace["result"], 3)
 
     def test_import_accepts_runtime_filenames_and_preserves_dimensions(self) -> None:
         from piecad import cube, square
@@ -2863,8 +3763,8 @@ class TranslatorTests(unittest.TestCase):
             translate([1, 2, 3]) import(file=filename(2), convexity=3);
             """)
         self.assertNotIn("import() requires a literal file name", generated)
-        self.assertIn("load(filename(1.0))", generated)
-        self.assertIn("load(filename(2.0))", generated)
+        self.assertIn("load(filename(1.0), svg_openscad=True)", generated)
+        self.assertIn("load(filename(2.0), svg_openscad=True)", generated)
         output = io.StringIO()
         namespace: dict[str, object] = {}
         with (
@@ -2876,6 +3776,10 @@ class TranslatorTests(unittest.TestCase):
         self.assertEqual(
             [call.args for call in load.call_args_list],
             [("part.stl",), ("drawing.svg",)],
+        )
+        self.assertEqual(
+            [call.kwargs for call in load.call_args_list],
+            [{"svg_openscad": True}, {"svg_openscad": True}],
         )
         self.assertEqual(namespace["_parts"][0].bounding_box(), (1, 2, 3, 2, 3, 4))
         self.assertEqual(namespace["_parts"][1].bounding_box(), (1, 2, 3, 4))
@@ -3079,6 +3983,11 @@ class TranslatorTests(unittest.TestCase):
     def test_import_centers_dynamic_2d_and_3d_geometry(self) -> None:
         from piecad import cube, square
 
+        def fake_load(filename, *, svg_openscad=False, center=False):
+            shape = (square(2).translate([4, 6]) if filename.endswith(".svg")
+                     else cube(2).translate([4, 6, 8]))
+            return shape.center() if center else shape
+
         generated = self.translate("""
             function value(label, result) = echo(label) result;
             import(file=value("file", "drawing.svg"), center=value("center", true));
@@ -3089,15 +3998,7 @@ class TranslatorTests(unittest.TestCase):
         output = io.StringIO()
         namespace: dict[str, object] = {}
         with (
-            patch(
-                "piecad.load",
-                side_effect=[
-                    square(2).translate([4, 6]),
-                    cube(2).translate([4, 6, 8]),
-                    cube(2).translate([4, 6, 8]),
-                    cube(2).translate([4, 6, 8]),
-                ],
-            ),
+            patch("piecad.load", side_effect=fake_load),
             redirect_stdout(output),
         ):
             exec(generated, namespace)
@@ -3151,10 +4052,23 @@ class TranslatorTests(unittest.TestCase):
             generated = self.translate(f'filename = "{path}"; import(filename);')
             namespace: dict[str, object] = {}
             exec(generated, namespace)
-            self.assertEqual(namespace["_parts"][0].bounding_box(), (0, 0, 2, 2))
+            self.assertEqual(namespace["_parts"][0].bounding_box(), (0, -2, 2, 0))
             path.unlink()
             with self.assertRaises(FileNotFoundError):
                 exec(generated, {})
+
+    def test_import_centered_svg_uses_openscad_viewbox_coordinates(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "drawing.svg"
+            path.write_text(
+                '<svg width="100mm" height="100mm" viewBox="10 20 100 100">'
+                '<path d="M20 30 L30 30 L30 40 L20 40 Z"/></svg>',
+                encoding="utf-8",
+            )
+            generated = self.translate(f'import("{path}", center=true);')
+            namespace: dict[str, object] = {}
+            exec(generated, namespace)
+            self.assertEqual(namespace["_parts"][0].bounding_box(), (-15, -25, -5, -15))
 
     def test_import_evaluates_assertion_filename_once(self) -> None:
         from piecad import cube
@@ -3163,7 +4077,7 @@ class TranslatorTests(unittest.TestCase):
         self.assertEqual(generated.count("def _scadtopy_assert_"), 1)
         with patch("piecad.load", return_value=cube(1)) as load:
             exec(generated, {})
-        load.assert_called_once_with("part.stl")
+        load.assert_called_once_with("part.stl", svg_openscad=True)
 
     def test_export_comment_saves_the_part_to_its_own_file(self) -> None:
         generated = self.translate(
@@ -3207,6 +4121,152 @@ class TranslatorTests(unittest.TestCase):
         namespace: dict[str, object] = {}
         exec(generated, namespace)
         self.assertFalse(namespace["_parts"][0].is_empty())
+
+    def test_empty_union_produces_no_geometry(self) -> None:
+        generated = self.translate(
+            "module nil() union() {} union() {} difference() {} "
+            "intersection() {} hull() {} cube(2);"
+        )
+        namespace: dict[str, object] = {}
+        exec(generated, namespace)
+        self.assertIsNone(namespace["nil"]())
+        self.assertEqual(len(namespace["_parts"]), 1)
+
+    def test_boolean_absent_and_empty_children(self) -> None:
+        generated = self.translate("""
+            module empty() {}
+            module scoped_empty(flag) {
+                if (flag) { x = 1; } else { x = 2; }
+            }
+            union() { cube(2); if (false) cube(1); }
+            difference() { cube(2); if (false) cube(1); }
+            difference() { if (false) cube(1); cube(2); }
+            difference() { empty(); cube(2); }
+            difference() { cube(2); empty(); }
+            intersection() { cube(2); if (false) cube(1); }
+            intersection() { cube(2); empty(); }
+            difference() { union() {} cube(2); }
+            intersection() { cube(2); union() {} }
+            union() { empty(); if (false) cube(1); }
+            difference() { if (true) { x = 1; } cube(2); }
+            difference() { scoped_empty(true); cube(2); }
+            """)
+        namespace: dict[str, object] = {}
+        exec(generated, namespace)
+        parts = namespace["_parts"]
+        for index in (0, 1, 2, 4, 5, 10):
+            self.assertEqual(parts[index].volume(), 8)
+        for index in (3, 6, 7, 8, 9, 11):
+            self.assertIsNone(parts[index])
+
+    def test_implicit_union_and_children_allow_absent_geometry(self) -> None:
+        generated = self.translate("""
+            module optional(show) { if (show) cube(1); }
+            module together() { cube(2); if (false) cube(1); }
+            module wrap() children();
+            together();
+            union() { optional(false); cube(2); }
+            wrap() { cube(2); if (false) cube(1); }
+            """)
+        namespace: dict[str, object] = {}
+        exec(generated, namespace)
+        self.assertEqual([part.volume() for part in namespace["_parts"]], [8, 8, 8])
+
+    def test_boolean_children_evaluate_once_and_mixed_types_still_fail(self) -> None:
+        generated = self.translate("""
+            module part(n) { echo(n); cube(n); }
+            difference() { part(2); if (false) part(3); part(1); }
+            """)
+        output = io.StringIO()
+        with redirect_stdout(output):
+            namespace: dict[str, object] = {}
+            exec(generated, namespace)
+        self.assertEqual(output.getvalue().splitlines(), ["2.0", "1.0"])
+        self.assertEqual(namespace["_parts"][0].volume(), 7)
+
+        mixed = self.translate("union() { cube(1); if (false) cube(1); square(1); }")
+        with self.assertRaisesRegex(Exception, "Mixed types"):
+            exec(mixed, {})
+
+    def test_conditional_echo_is_not_an_empty_difference_operand(self) -> None:
+        generated = self.translate("""
+            difference() { if (true) echo("no geometry"); cube(2); }
+            """)
+        output = io.StringIO()
+        with redirect_stdout(output):
+            namespace: dict[str, object] = {}
+            exec(generated, namespace)
+        self.assertEqual(output.getvalue(), "no geometry\n")
+        self.assertEqual(namespace["_parts"][0].volume(), 8)
+
+    def test_translate_empty_geometry_evaluates_vector_once(self) -> None:
+        generated = self.translate("""
+            module empty() {}
+            difference() {
+                translate(echo("vector") [1, 2, 3]) if (false) cube(1);
+                cube(2);
+            }
+            translate([1, 2, 3]) empty();
+            """)
+        output = io.StringIO()
+        with redirect_stdout(output):
+            namespace: dict[str, object] = {}
+            exec(generated, namespace)
+        self.assertEqual(output.getvalue(), "vector\n")
+        self.assertEqual(namespace["_parts"], [None, None])
+
+    def test_unsupported_geometry_is_still_reported(self) -> None:
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            generated = self.translate("union() { cube(1); if (true) surface(); }")
+        self.assertTrue(any("surface()" in str(w.message) for w in caught))
+        self.assertIn("UNSUPPORTED: surface()", generated)
+
+    def test_minkowski_with_missing_operand_is_reported_and_omitted(self) -> None:
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            generated = self.translate("""
+                minkowski() { missing(); cube(1); }
+                cube(2);
+                """)
+        self.assertTrue(any("minkowski()" in str(w.message) for w in caught))
+        self.assertTrue(any("missing" in str(w.message) for w in caught))
+        namespace: dict[str, object] = {}
+        exec(generated, namespace)
+        self.assertEqual(len(namespace["_parts"]), 1)
+        self.assertEqual(namespace["_parts"][0].bounding_box(), (0, 0, 0, 2, 2, 2))
+
+    def test_minkowski_with_one_active_child_preserves_it(self) -> None:
+        generated = self.translate("""
+            minkowski() cube(1);
+            minkowski() { *sphere(1); cube(2); }
+            """)
+        namespace: dict[str, object] = {}
+        exec(generated, namespace)
+        self.assertEqual([part.volume() for part in namespace["_parts"]], [1, 8])
+
+    def test_named_arguments_before_positional_arguments_in_user_calls(self) -> None:
+        generated = self.translate("""
+            module part(a, b) cube(a + b);
+            function value(a, b) = a + b;
+            part(b=echo("module named") 2, echo("module positional") 3);
+            result = value(b=echo("function named") 4, echo("function positional") 5);
+            """)
+        namespace: dict[str, object] = {}
+        output = io.StringIO()
+        with redirect_stdout(output):
+            exec(generated, namespace)
+        self.assertEqual(namespace["result"], 9)
+        self.assertEqual(namespace["_parts"][0].volume(), 125)
+        self.assertEqual(
+            output.getvalue().splitlines(),
+            [
+                "module named",
+                "module positional",
+                "function named",
+                "function positional",
+            ],
+        )
 
     def test_translates_projection_shadow_and_cut(self) -> None:
         shadow = self.translate("projection() cube(2);")

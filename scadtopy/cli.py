@@ -6,7 +6,7 @@ import argparse
 import sys
 from pathlib import Path
 
-from .translator import TranslationError, translate_file
+from .translator import TranslationError, _python_module_name, translate_file
 
 
 def _format(source: str) -> str:
@@ -30,10 +30,12 @@ def main() -> int:
         "-o",
         "--output",
         type=Path,
-        help="output .py file (defaults to the input path with a .py extension)",
+        help="output .py file (defaults to the input name, avoiding standard-library collisions)",
     )
     args = parser.parse_args()
-    output = args.output or args.source.with_suffix(".py")
+    output = args.output or args.source.with_name(
+        _python_module_name(args.source.stem) + ".py"
+    )
 
     try:
         python_source = _format(translate_file(args.source))
